@@ -1,6 +1,8 @@
 const browserAPI = globalThis.browser ?? globalThis.chrome;
 const app = document.querySelector("#app");
 const popup = document.body.classList.contains("popup");
+const startup = document.querySelector("#startup");
+const startupTime = performance.now();
 const paths = {
   lock: '<rect x="4" y="10" width="16" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
   safe: '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="12" cy="12" r="4"/><path d="M12 6v3m0 6v3m-6-6h3m6 0h3"/>',
@@ -189,16 +191,18 @@ async function boot() {
   origin = url?.startsWith("https://") ? new URL(url).origin : "";
   await reload(true);
   if (version !== epoch) return;
-  if (!popup && params.has("add")) {
+  if (!popup && (params.has("add") || params.has("review"))) {
+    const draftId = params.get("review");
     params.delete("add");
+    params.delete("review");
     history.replaceState({}, "", location.pathname);
-    await edit(null, true);
+    await edit(null, true, draftId);
   }
 }
 async function reload(animate = false) {
   const version = epoch;
   const data = await rpc("list");
-  const info = popup && origin ? await rpc("site", { origin, tab }) : {};
+  const info = popup && tab ? await rpc("site", { origin, tab }) : {};
   if (version !== epoch || !unlocked) return;
   entries = data;
   site = info;
@@ -276,21 +280,15 @@ function renderPopup(animate) {
     help.addEventListener("focusout", resetTooltip);
   }
   if (site.pending) {
-    const existing = entries.some(
-      (e) => e.origin === origin && e.username === site.pending,
-    );
+    const offer = site.pending;
+    const method = offer.provider || offer.method;
     $(".picker").insertAdjacentHTML(
       "afterbegin",
-      '<div class="pending"><b>' +
-        (existing ? "Update password?" : "Save this account?") +
-        "</b><div>" +
-        esc(site.pending) +
-        " · " +
-        esc(host(origin)) +
-        '</div><div class="actions">' +
-        btn("add", "Review", null, "primary") +
-        btn("dismiss", "Dismiss") +
-        "</div></div>",
+      `<div class="pending"><b>${offer.existingId ? "Update password?" : "Save this sign-in?"}</b>
+        <div>${esc(host(offer.origin))} · ${esc(method)}</div>
+        ${offer.username ? `<div>${esc(offer.username)}</div>` : ""}
+        <div class="actions">${btn("review", "Review and save", null, "primary")}${btn("dismiss", "Don’t save")}</div>
+      </div>`,
     );
   }
 }
@@ -406,7 +404,7 @@ function renderItems() {
         "</div></div></div>"
       : "") +
     '<div class="field"><small>Sign-in method</small>' +
-    esc(e.method) +
+    esc(e.provider ? `${e.method} · ${e.provider}` : e.method) +
     '</div><div class="actions">' +
     btn("edit", "Edit", "edit") +
     btn("delete", "Delete", null, "ghost danger") +
@@ -472,39 +470,47 @@ function changeProtection() {
     }
   };
 }
-async function edit(id, recall = false) {
-  const pending = recall && origin && (await rpc("draft", { origin, tab }));
-  const old =
-    id ||
-    (pending &&
-      entries.find(
-        (e) => e.origin === origin && e.username === pending.username,
-      )?.id);
+async function edit(id, recall = false, draftId = null) {
+  const pending =
+    recall &&
+    (origin || draftId) &&
+    (await rpc("draft", { origin, tab, draftId }));
+  if (draftId && pending?.id !== draftId) {
+    notice("This save offer is no longer available.");
+    return;
+  }
+  const old = id || pending?.existingId;
   const entry = old ? await rpc("detail", { id: old }) : {};
   const data = { ...entry, ...(pending || {}) };
   const d = modal(
     "<h2>" +
-      (old ? "Edit login account" : "Add login account") +
+      (pending
+        ? old
+          ? "Update password?"
+          : "Save this sign-in?"
+        : old
+          ? "Edit login account"
+          : "Add login account") +
       '</h2><form><label>Website<input required name="origin" placeholder="Website address"></label><label>Account label<input name="label" placeholder="Personal or Work"></label><label>Email or username<input required name="username" autocomplete="off"></label><label>Sign-in method<select name="method">' +
       ["Password", "Email", "Provider", "Passkey"]
         .map((v) => "<option>" + v + "</option>")
         .join("") +
-      '</select></label><label id="pwlabel">Password<input name="password" type="password" autocomplete="new-password"></label><div class="err" role="alert"></div><div class="actions">' +
-      btn("close", "Cancel") +
+      '</select></label><label id="providerlabel">Provider<input name="provider" maxlength="60" placeholder="Google, GitHub or Microsoft"></label><label id="pwlabel">Password<input name="password" type="password" autocomplete="new-password"></label><div class="err" role="alert"></div><div class="actions">' +
+      (pending ? btn("discard-offer", "Don’t save") : btn("close", "Cancel")) +
       '<button class="primary">Save account</button></div></form>',
   );
   const f = d.querySelector("form");
+  if (pending) d.dataset.draftId = pending.id;
   f.elements.origin.value = data.origin || origin;
+  f.elements.origin.readOnly = !!pending;
   f.elements.label.value = data.label || "";
   f.elements.username.value = data.username || "";
   f.elements.password.value = data.password || "";
-  f.elements.method.value = pending
-    ? pending.password
-      ? "Password"
-      : "Email"
-    : data.method || "Password";
+  f.elements.provider.value = data.provider || "";
+  f.elements.method.value = data.method || "Password";
   const method = () => {
     $("#pwlabel").hidden = f.elements.method.value !== "Password";
+    $("#providerlabel").hidden = f.elements.method.value !== "Provider";
     f.elements.password.required = !$("#pwlabel").hidden;
   };
   f.elements.method.onchange = method;
@@ -522,6 +528,7 @@ async function edit(id, recall = false) {
         ...fields,
         id: old || undefined,
         expectedUpdated: entry.updated,
+        draftId: pending?.id,
         tab,
       });
       await closeDialog(d);
@@ -535,14 +542,25 @@ async function edit(id, recall = false) {
 }
 async function action(a, button) {
   if (a === "close") return closeDialog($("dialog"));
+  if (a === "discard-offer") {
+    const dialog = $("dialog");
+    await rpc("dismiss", { tab, draftId: dialog.dataset.draftId });
+    return closeDialog(dialog);
+  }
   if (a === "lock") {
     await rpc("lock");
     return boot();
   }
-  if (popup && ["manage", "add", "settings"].includes(a)) {
+  if (popup && ["manage", "add", "review", "settings"].includes(a)) {
     if (app.hasAttribute("data-closing")) return;
     const query =
-      a === "settings" ? "?settings=1" : a === "add" ? "?add=1&tab=" + tab : "";
+      a === "review"
+        ? "?tab=" + tab + "&review=" + site.pending.id
+        : a === "settings"
+          ? "?settings=1"
+          : a === "add"
+            ? "?add=1&tab=" + tab
+            : "";
     await playExit(app);
     try {
       await browserAPI.tabs.create({
@@ -615,7 +633,7 @@ async function action(a, button) {
     return;
   }
   if (a === "dismiss") {
-    await rpc("dismiss", { tab, origin });
+    await rpc("dismiss", { tab, origin, draftId: site.pending?.id });
     return reload();
   }
   if (a === "prompts") {
@@ -687,4 +705,21 @@ browserAPI.storage.onChanged.addListener((changes, area) => {
   )
     reload().catch(error);
 });
-boot().catch(error);
+boot()
+  .catch(error)
+  .finally(async () => {
+    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      await new Promise((resolve) =>
+        setTimeout(
+          resolve,
+          Math.max(0, 210 - (performance.now() - startupTime)),
+        ),
+      );
+    }
+    startup.dataset.ready = "";
+    await Promise.allSettled(
+      startup.getAnimations().map((animation) => animation.finished),
+    );
+    startup.remove();
+    app.removeAttribute("aria-busy");
+  });

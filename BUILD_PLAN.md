@@ -28,9 +28,9 @@ Discover sign-out and sign-in controls from the active page. Use the same logic 
 
 ## Saving at sign-in and sign-up
 
-Enable save prompts by default on HTTPS pages where the browser grants access. Let the user disable prompts per site and place help beside the control. While the vault is unlocked, offer **Save account** for a new login and **Update password** when an existing account’s password changes. Show the site and username so the user can verify the destination. A second email on the same site creates a separate entry. [Extension permissions](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
+Enable save prompts by default on HTTPS pages where the browser grants access. Let the user disable prompts per site and place help beside the control. While the vault is unlocked, open the picker for a detected sign-in in the active tab. If the browser cannot open the picker programmatically, open the review in a tab. Show the site and sign-in method so the user can confirm before saving. [Extension permissions](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
 
-Hold a submitted login briefly in extension memory so the save prompt survives the website redirect. Save it to the encrypted vault only after confirmation. Discard the pending entry on dismissal, expiry or lock. Exclude one-time codes and passkey challenges. If the user missed the prompt, Add login account can recall the pending entry during that window.
+Hold a submitted login briefly in extension memory so the save prompt survives a same-site redirect. For an email, provider, or passkey flow, wait for a recognizable signed-in state on the original site. Provider and passkey entries record the method and the account identity supplied by the site or confirmed by the user. Exclude one-time codes, provider passwords from delegated flows, and passkey challenges. Discard the pending entry on dismissal, expiry, or vault lock.
 
 ## The full vault
 

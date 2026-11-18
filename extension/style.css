@@ -815,3 +815,77 @@ dialog .actions {
     transform: none;
   }
 }
+
+#startup {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  background: radial-gradient(
+    ellipse at 50% 35%,
+    #142740 0%,
+    #0b121c 55%,
+    #090e15 100%
+  );
+  animation: startup-appear 180ms var(--ease);
+  transition:
+    opacity 260ms var(--ease),
+    visibility 260ms;
+}
+.popup:has(#startup) {
+  min-height: 244px;
+}
+.popup #startup {
+  border-radius: 23px;
+}
+#startup[data-ready] {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+#startup strong {
+  font-size: 23px;
+  letter-spacing: -0.7px;
+}
+.startup-caption {
+  font-size: 12px;
+  color: var(--muted);
+}
+.startup-track {
+  position: relative;
+  width: 96px;
+  height: 3px;
+  margin: 4px 0;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #28394f;
+}
+.startup-track::after {
+  content: "";
+  position: absolute;
+  width: 42%;
+  height: 100%;
+  left: 29%;
+  border-radius: inherit;
+  background: #65b8ff;
+  animation: startup-progress 1150ms ease-in-out infinite alternate;
+}
+@keyframes startup-appear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes startup-progress {
+  from {
+    transform: translateX(-130%);
+  }
+  to {
+    transform: translateX(130%);
+  }
+}

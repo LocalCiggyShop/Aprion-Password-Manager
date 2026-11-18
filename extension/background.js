@@ -130,7 +130,7 @@ async function advance(job, entries) {
         "Choose " +
         entry.username +
         " using " +
-        entry.method.toLowerCase() +
+        (entry.provider || entry.method.toLowerCase()) +
         " sign-in.";
       job.filled = true;
     } else {
@@ -157,65 +157,171 @@ async function advance(job, entries) {
   if (JSON.stringify(job) !== original) await memory.set({ [key]: job });
   return !job.filled;
 }
-async function draftFor(sender, m, s, record, key) {
-  const origin = originOf(sender.url);
-  if (!key || !origin || (await promptsDisabled()).includes(origin))
-    return false;
-  if (m.type === "canCapture")
-    return {
-      enabled: true,
-      pending: s["draft:" + sender.tab.id]?.origin === origin,
-    };
-  const tab = sender.tab.id;
-  const stepKey = "identity:" + tab;
-  if (
-    m.type === "identity" &&
-    typeof m.username === "string" &&
-    m.username.length <= 512
-  ) {
-    await memory.set({
-      [stepKey]: {
-        origin,
-        username: m.username.trim(),
-        expires: Date.now() + lifetime,
-      },
-    });
-    return false;
-  }
-  if (!m.username && s[stepKey]?.origin === origin)
-    m.username = s[stepKey].username;
-  if (m.password) await memory.remove(stepKey);
-  if (
-    !m.username?.trim() ||
-    typeof m.password !== "string" ||
-    m.password.length > 4096 ||
-    m.username.length > 512
-  )
-    return false;
-  const entries = await unseal(record, key);
-  const previous = entries.find(
-    (e) => e.origin === origin && e.username === m.username,
+const methods = ["Password", "Email", "Provider", "Passkey"];
+function providerName(method, name) {
+  return method === "Provider"
+    ? String(name || "")
+        .trim()
+        .slice(0, 60)
+    : "";
+}
+function matchingLogin(entries, login) {
+  return entries.find(
+    (e) =>
+      e.origin === login.origin &&
+      e.username === login.username &&
+      e.method === login.method &&
+      providerName(e.method, e.provider).toLowerCase() ===
+        providerName(login.method, login.provider).toLowerCase(),
   );
-  if (previous && (!m.password || previous.password === m.password))
-    return false;
-  const expires = Date.now() + lifetime;
-  await memory.set({
-    ["draft:" + tab]: {
-      origin,
-      username: m.username,
-      password: m.password,
-      tab,
-      expires,
-    },
-  });
+}
+async function expireAt(expires) {
   await browserAPI.alarms.create("expire", {
     when: Math.min(
       expires,
       (await browserAPI.alarms.get("expire"))?.scheduledTime || expires,
     ),
   });
+}
+async function draftFor(sender, m, s, record, key) {
+  const origin = originOf(sender.url);
+  const tab = sender.tab.id;
+  const attemptKey = "attempt:" + tab;
+  const attempt = s[attemptKey];
+  const parentAttempt = s["attempt:" + sender.tab.openerTabId];
+  if (!key || !origin || (await promptsDisabled()).includes(origin))
+    return false;
+  if (
+    [attempt, parentAttempt].some(
+      (a) => a && a.origin !== origin && a.method === "Provider",
+    )
+  )
+    return false; // The identity provider handles its own credentials.
+
+  const draftKey = "draft:" + tab;
+  if (m.type === "canCapture") {
+    if (s[draftKey] && s[draftKey].origin !== origin) {
+      await memory.remove(draftKey);
+      await browserAPI.action.setBadgeText({ tabId: tab, text: "" });
+    }
+    return {
+      enabled: true,
+      pending: s[draftKey]?.origin === origin,
+      watch: attempt?.origin === origin,
+    };
+  }
+
+  const username =
+    typeof m.username === "string" ? m.username.trim().slice(0, 512) : "";
+  const expires = Date.now() + lifetime;
+  if (m.type === "attempt") {
+    if (!["Email", "Provider", "Passkey"].includes(m.method)) return false;
+    await memory.set({
+      [attemptKey]: {
+        origin,
+        tab,
+        method: m.method,
+        provider: providerName(m.method, m.provider),
+        username,
+        expires,
+      },
+    });
+    await expireAt(expires);
+    return { watch: true };
+  }
+
+  let login;
+  if (m.type === "completed") {
+    if (attempt?.origin !== origin) return false;
+    await memory.remove(attemptKey);
+    login = {
+      method: attempt.method,
+      provider: attempt.provider,
+      username: attempt.username || username,
+      password: "",
+    };
+  } else {
+    if (
+      typeof m.password !== "string" ||
+      !m.password ||
+      m.password.length > 4096
+    )
+      return false;
+    const account =
+      username || (attempt?.origin === origin ? attempt.username : "");
+    if (!account) return false;
+    if (attempt?.origin === origin) await memory.remove(attemptKey);
+    login = {
+      method: "Password",
+      provider: "",
+      username: account,
+      password: m.password,
+    };
+  }
+
+  const entries = await unseal(record, key);
+  const previous = matchingLogin(entries, { ...login, origin });
+  if (previous && previous.password === login.password) return false;
+  const pending = s[draftKey];
+  if (
+    pending?.origin === origin &&
+    Object.keys(login).every((field) => login[field] === pending[field])
+  )
+    return false;
+
+  const id = crypto.randomUUID();
+  await memory.set({
+    [draftKey]: {
+      ...login,
+      origin,
+      tab,
+      expires,
+      id,
+      existingId: previous?.id ?? null,
+    },
+  });
+  await expireAt(expires);
   await browserAPI.action.setBadgeText({ tabId: tab, text: "SAVE" });
-  return true;
+  return { promptId: id };
+}
+
+async function showPrompt(tab, id) {
+  const [active] = await browserAPI.tabs.query({
+    active: true,
+    lastFocusedWindow: true,
+  });
+  if (active?.id !== tab || active.incognito) return;
+
+  const draft = await serialized(async () => {
+    const s = await clean();
+    const draftKey = "draft:" + tab;
+    const draft = s[draftKey];
+    if (!draft || draft.prompted || (id && draft.id !== id)) return null;
+    if (originOf(active.url) && originOf(active.url) !== draft.origin)
+      return null;
+    await memory.set({ [draftKey]: { ...draft, prompted: true } });
+    return draft;
+  });
+  if (!draft) return;
+
+  // Background calls to openPopup depend on the browser and its version.
+  if (browserAPI.action.openPopup) {
+    try {
+      await browserAPI.action.openPopup({ windowId: active.windowId });
+      return;
+    } catch {}
+  }
+  const [stillActive] = await browserAPI.tabs.query({
+    active: true,
+    lastFocusedWindow: true,
+  });
+  if (stillActive?.id !== tab) return;
+  await browserAPI.tabs.create({
+    windowId: active.windowId,
+    url: browserAPI.runtime.getURL(
+      "vault.html?tab=" + tab + "&review=" + draft.id,
+    ),
+  });
 }
 async function handle(m, sender) {
   if (sender.tab?.incognito)
@@ -230,7 +336,7 @@ async function handle(m, sender) {
   if (!ui) {
     if (!sender.tab || sender.frameId !== 0)
       throw Error("Top-level tab required.");
-    if (["canCapture", "capture", "identity"].includes(m.type))
+    if (["canCapture", "capture", "attempt", "completed"].includes(m.type))
       return draftFor(sender, m, s, record, key);
     const job = s["job:" + originOf(sender.url)];
     if (
@@ -272,7 +378,11 @@ async function handle(m, sender) {
   const entry = entries.find((e) => e.id === m.id);
   const origin = originOf(m.origin);
   const draftKey = "draft:" + m.tab;
-  const draft = s[draftKey]?.origin === origin ? s[draftKey] : null;
+  const candidate = s[draftKey];
+  const draft =
+    candidate && (candidate.origin === origin || candidate.id === m.draftId)
+      ? candidate
+      : null;
   switch (m.type) {
     case "list":
       return entries.map(publicEntry);
@@ -280,11 +390,7 @@ async function handle(m, sender) {
       if (!entry) throw Error("Account no longer exists.");
       return entry;
     case "save": {
-      if (
-        !origin ||
-        !m.username?.trim() ||
-        !["Password", "Email", "Provider", "Passkey"].includes(m.method)
-      )
+      if (!origin || !m.username?.trim() || !methods.includes(m.method))
         throw Error("Enter a valid HTTPS website and username.");
       if (
         m.expectedUpdated !== undefined &&
@@ -295,14 +401,18 @@ async function handle(m, sender) {
         );
       if (m.id && !entry) throw Error("Account no longer exists.");
       if (
-        entries.some(
-          (e) =>
-            e.id !== m.id &&
-            e.origin === origin &&
-            e.username === m.username.trim(),
+        m.draftId &&
+        (!draft || draft.id !== m.draftId || draft.origin !== origin)
+      )
+        throw Error("This save offer is no longer available.");
+      const provider = providerName(m.method, m.provider);
+      if (
+        matchingLogin(
+          entries.filter((e) => e.id !== m.id),
+          { origin, username: m.username.trim(), method: m.method, provider },
         )
       )
-        throw Error("That login already exists for this website.");
+        throw Error("That sign-in is already saved for this website.");
       if (m.method === "Password" && !m.password)
         throw Error("Enter the password for this account.");
       const data = {
@@ -311,11 +421,13 @@ async function handle(m, sender) {
         username: m.username.trim(),
         label: m.label.trim() || m.username.trim(),
         method: m.method,
+        provider,
         password: m.method === "Password" ? m.password : "",
         updated: Date.now(),
       };
       await write([data, ...entries.filter((e) => e.id !== data.id)]);
-      if (draft && draft.username === data.username) await dismiss();
+      if (draft && (m.draftId || draft.username === data.username))
+        await dismiss();
       return data.id;
     }
     case "delete":
@@ -324,12 +436,23 @@ async function handle(m, sender) {
     case "draft":
       return draft;
     case "dismiss":
+      if (m.draftId && draft?.id !== m.draftId) return;
       return dismiss();
     case "site": {
-      if (!origin) return {};
+      const pending =
+        candidate && (!origin || candidate.origin === origin)
+          ? {
+              id: candidate.id,
+              origin: candidate.origin,
+              username: candidate.username,
+              method: candidate.method,
+              provider: candidate.provider,
+              existingId: candidate.existingId,
+            }
+          : null;
       const job = s["job:" + origin];
       let current;
-      if (m.tab) {
+      if (m.tab && origin) {
         const info = await execute(m.tab, interactWithSite, [origin, {}]).catch(
           () => null,
         );
@@ -337,7 +460,7 @@ async function handle(m, sender) {
       }
       return {
         enabled: !(await promptsDisabled()).includes(origin),
-        pending: draft?.username,
+        pending,
         last: s["last:" + origin],
         message: job?.message,
         current,
@@ -353,7 +476,7 @@ async function handle(m, sender) {
 
       const pending = Object.entries(s).filter(
         ([name, value]) =>
-          (name.startsWith("draft:") || name.startsWith("identity:")) &&
+          (name.startsWith("draft:") || name.startsWith("attempt:")) &&
           value.origin === origin,
       );
       await memory.remove(pending.map(([name]) => name));
@@ -396,15 +519,29 @@ async function handle(m, sender) {
     await browserAPI.action
       .setBadgeText({ tabId: m.tab, text: "" })
       .catch(() => {});
+    if (m.tab)
+      await browserAPI.tabs
+        .sendMessage(m.tab, { type: "refreshCapture" }, { frameId: 0 })
+        .catch(() => {});
   }
 }
 browserAPI.runtime.onMessage.addListener((m, sender, reply) => {
   serialized(() => handle(m, sender)).then(
-    (value) => reply({ value }),
+    (value) => {
+      reply({ value });
+      if (value?.promptId && sender.tab)
+        setTimeout(
+          () => showPrompt(sender.tab.id, value.promptId).catch(() => {}),
+          400,
+        );
+    },
     (err) => reply({ error: err.message }),
   );
   return true;
 });
+browserAPI.tabs.onActivated.addListener(({ tabId }) =>
+  showPrompt(tabId).catch(() => {}),
+);
 browserAPI.runtime.onInstalled.addListener(() => {
   serialized(async () => {
     // Save prompts now use the manifest's content script on every HTTPS site.
@@ -444,12 +581,6 @@ browserAPI.tabs.onUpdated.addListener((id, change, tab) => {
         await memory.remove(name);
         await browserAPI.action.setBadgeText({ tabId: id, text: "" });
       }
-      if (
-        name === "identity:" + id &&
-        change.url &&
-        originOf(change.url) !== job.origin
-      )
-        await memory.remove(name);
       if (!name.startsWith("job:") || job.tab !== id) continue;
       if (originOf(tab.url) !== job.origin) await memory.remove(name);
       else if (change.status === "complete" && !job.filled)
@@ -485,10 +616,6 @@ browserAPI.storage.onChanged.addListener((changes, area) => {
 browserAPI.tabs.onRemoved.addListener((id) =>
   serialized(async () => {
     const state = await memory.get(null);
-    await memory.remove(
-      Object.keys(state).filter(
-        (k) => state[k]?.tab === id || k === "identity:" + id,
-      ),
-    );
+    await memory.remove(Object.keys(state).filter((k) => state[k]?.tab === id));
   }),
 );

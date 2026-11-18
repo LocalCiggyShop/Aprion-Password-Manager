@@ -318,9 +318,53 @@ async function run(restartId, deviceSetup = false) {
       `var form=document.forms[0];form.username.value=${JSON.stringify(username)};document.querySelector('[type=password]').value=${JSON.stringify(password)};form.requestSubmit();`,
     );
   }
+  async function findPicker() {
+    return (await cmd("Target.getTargets")).targetInfos.find((target) =>
+      target.url.endsWith("/popup.html"),
+    );
+  }
+  async function closePicker() {
+    const popup = await findPicker();
+    if (popup)
+      await ev(
+        await attach(popup.targetId),
+        "setTimeout(() => window.close(), 0)",
+      );
+    await until(async () => !(await findPicker()), "picker closes");
+  }
+  async function clickSiteButton(selector) {
+    const point = await ev(
+      siteSession,
+      `{
+      const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+      ({x: rect.x + rect.width / 2, y: rect.y + rect.height / 2});
+    }`,
+    );
+    await cmd(
+      "Input.dispatchMouseEvent",
+      { type: "mousePressed", button: "left", clickCount: 1, ...point },
+      siteSession,
+    );
+    await cmd(
+      "Input.dispatchMouseEvent",
+      { type: "mouseReleased", button: "left", clickCount: 1, ...point },
+      siteSession,
+    );
+  }
   await visit("https://accounts-fixture.test/login");
   await sleep(150);
   await submitLogin("new@accounts-fixture.test", "sample-password-v1");
+  await until(findPicker, "save offer automatically opens the picker");
+  const automaticPicker = await attach((await findPicker()).targetId);
+  await until(
+    () =>
+      ev(
+        automaticPicker,
+        "document.querySelector('.pending')?.innerText.includes('new@accounts-fixture.test') && !document.querySelector('#startup')",
+      ),
+    "automatic offer displays after loading",
+  );
+  await closePicker();
   await grantAction();
   const tabId = await ev(
     service,
@@ -498,8 +542,132 @@ async function run(restartId, deviceSetup = false) {
     "re-enabled prompts work",
   );
   await rpc("dismiss", context);
+  await closePicker();
   console.log(
     "Brave passed: automatic save prompts, tooltip, confirmed updates, and per-site controls.",
+  );
+  const signedIn =
+    "<header>provider-account@example.test <button>Sign out</button></header>";
+  for (const [method, provider] of [
+    ["Provider", "Google"],
+    ["Passkey", ""],
+    ["Email", ""],
+  ]) {
+    await cmd("Target.activateTarget", { targetId: siteTarget });
+    fixture = method === "Email" ? "email" : "delegated";
+    pages.delegated =
+      '<button id="sign-in">' +
+      (provider ? "Continue with " + provider : "Sign in with a passkey") +
+      "</button>";
+    await visit(context.origin + "/login?flow=" + method);
+    await sleep(150);
+    if (method === "Email")
+      await ev(
+        siteSession,
+        `{
+      const form = document.forms[0];
+      form.addEventListener("submit", event => event.preventDefault());
+      form.email.value = "email-account@example.test";
+      form.requestSubmit();
+    }`,
+      );
+    else await clickSiteButton("#sign-in");
+    await sleep(650);
+    assert.equal(
+      await rpc("draft", context),
+      null,
+      "wait for sign-in confirmation",
+    );
+
+    if (provider) {
+      fixture = "password";
+      await visit("https://identity-fixture.test/auth");
+      await submitLogin(
+        "provider-account@example.test",
+        "fixture-provider-password",
+      );
+      assert.equal(
+        await rpc("draft", {
+          tab: tabId,
+          origin: "https://identity-fixture.test",
+        }),
+        null,
+      );
+      pages.authenticated = signedIn;
+      fixture = "authenticated";
+      await visit(context.origin + "/dashboard");
+    } else {
+      await ev(
+        siteSession,
+        "document.body.innerHTML=" + JSON.stringify(signedIn),
+      );
+    }
+    await until(
+      async () => (await rpc("draft", context))?.method === method,
+      method + " save offer",
+    );
+    const offer = await rpc("draft", context);
+    assert.equal(offer.provider, provider);
+    assert.equal(offer.password, "");
+    assert.equal(
+      offer.username,
+      method === "Email"
+        ? "email-account@example.test"
+        : "provider-account@example.test",
+    );
+    await until(findPicker, method + " opens the picker");
+    if (provider) {
+      const popup = await attach((await findPicker()).targetId);
+      await until(
+        () =>
+          ev(
+            popup,
+            "document.querySelector('[data-act=review]') && !document.querySelector('#startup')",
+          ),
+        "provider review button",
+      );
+      const existing = new Set(
+        (await cmd("Target.getTargets")).targetInfos.map((t) => t.targetId),
+      );
+      await ev(popup, "document.querySelector('[data-act=review]').click()");
+      let reviewTab;
+      await until(async () => {
+        reviewTab = (await cmd("Target.getTargets")).targetInfos.find(
+          (t) =>
+            !existing.has(t.targetId) &&
+            t.url.startsWith("chrome-extension://" + id + "/vault.html"),
+        );
+        return !!reviewTab;
+      }, "automatic offer opens review");
+      const reviewSession = await attach(reviewTab.targetId);
+      await until(
+        () =>
+          ev(
+            reviewSession,
+            "document.querySelector('dialog form')?.elements.provider.value === 'Google'",
+          ),
+        "review remembers provider",
+      );
+      await ev(
+        reviewSession,
+        "document.querySelector('dialog form').requestSubmit()",
+      );
+      await until(
+        async () => (await rpc("list")).some((e) => e.provider === "Google"),
+        "provider saves after confirmation",
+      );
+      const saved = (await rpc("list")).find((e) => e.provider === "Google");
+      assert.equal(saved.hasPassword, false);
+      await rpc("delete", { id: saved.id });
+      await cmd("Target.closeTarget", { targetId: reviewTab.targetId });
+      await cmd("Target.activateTarget", { targetId: siteTarget });
+    } else {
+      await rpc("dismiss", context);
+    }
+    await closePicker();
+  }
+  console.log(
+    "Brave passed: provider redirect, passkey and email offers, and passwordless review.",
   );
   fixture = "email";
   await visit(context.origin + "/login");

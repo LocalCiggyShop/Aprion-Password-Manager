@@ -2,6 +2,7 @@
   <img src="extension/icons/128.png" alt="Aprion icon" width="72" height="72">
   <h1>Aprion Password Manager</h1>
   <p><strong>100% local.</strong> Save and switch between website accounts.</p>
+  <p>Review detected password, email, provider, and passkey sign-ins before saving.</p>
   <p><a href="https://github.com/LocalCiggyShop/Aprion-Password-Manager/releases/latest/download/Aprion-Password-Manager.zip"><strong>Download Aprion</strong></a> · <a href="#install">Install</a></p>
 </div>
 
