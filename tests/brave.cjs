@@ -275,11 +275,17 @@ async function run(restartId, deviceSetup = false) {
       recordSubmission +
       '><input type="email" name="email"><button>Continue with Email</button></form>',
   };
+  const fixtureSessions = new Set([siteSession]);
   client.addEventListener("message", (e) => {
     const m = JSON.parse(e.data);
-    if (m.method === "Fetch.requestPaused" && m.sessionId === siteSession) {
+    if (
+      m.method === "Fetch.requestPaused" &&
+      fixtureSessions.has(m.sessionId)
+    ) {
       const url = new URL(m.params.request.url);
       let html = pages[fixture];
+      if (fixture === "providerSwitch")
+        html = pages[url.pathname] || "<p>Unexpected route</p>";
       if (fixture === "signed" && url.pathname === "/login")
         html =
           '<form method="post" action="/session">' + passwordFields + "</form>";
@@ -304,7 +310,7 @@ async function run(restartId, deviceSetup = false) {
           responseHeaders: [{ name: "Content-Type", value: "text/html" }],
           body: Buffer.from(html).toString("base64"),
         },
-        siteSession,
+        m.sessionId,
       ).catch(() => {});
     }
   });
@@ -710,6 +716,158 @@ async function run(restartId, deviceSetup = false) {
   }
   console.log(
     "Brave passed: provider redirect, passkey and email offers, and passwordless review.",
+  );
+  fixture = "providerSwitch";
+  const googlePath = "/v3/signin/accountchooser";
+  const googleUrl = "https://accounts.google.com" + googlePath;
+  const msPath = "/common/oauth2/v2.0/authorize";
+  const msUrl = "https://login.microsoftonline.com" + msPath;
+  const email = "selected@example.test";
+  const different = "another@example.test";
+  const googleRow = (address) =>
+    `<div role="link" tabindex="0" data-identifier="${address}" onclick="location.href='${context.origin}/returned?email=${address}'">${address}</div>`;
+  pages["/returned"] =
+    `<header><span></span><button>Sign out</button></header><script>document.querySelector('span').textContent=new URLSearchParams(location.search).get('email')</script>`;
+  pages["/provider-start"] =
+    `<header>${different}<button onclick="location.href='/login'">Sign out</button></header>`;
+  pages["/login"] =
+    `<form method="post">${passwordFields}</form><button onclick="throw Error('wrong provider')">Continue with GitHub</button><button aria-label="Sign in with Google" onclick="location.href='${googleUrl}'">G</button>`;
+  pages[googlePath] =
+    googleRow(different) +
+    `<script>setTimeout(()=>document.body.insertAdjacentHTML('beforeend',${JSON.stringify(googleRow(email))}),300)</script>`;
+  const idpEntry = (provider) =>
+    rpc("save", {
+      origin: context.origin,
+      username: email,
+      method: "Provider",
+      provider,
+      label: provider + " work",
+    });
+  const googleEntry = await idpEntry("Google");
+  const microsoftEntry = await idpEntry("Microsoft");
+  const pick = async (id) => {
+    await grantAction();
+    const popup = await attach((await findPicker()).targetId);
+    const selector = JSON.stringify(
+      '[data-act="switch"][data-id="' + id + '"]',
+    );
+    await until(
+      () =>
+        ev(
+          popup,
+          "!!document.querySelector(" +
+            selector +
+            ") && !document.querySelector('#startup')",
+        ),
+      "saved provider in picker",
+    );
+    await ev(popup, "document.querySelector(" + selector + ").click()");
+  };
+  await visit(context.origin + "/provider-start");
+  await pick(googleEntry);
+  await until(
+    async () => (await rpc("site", context)).last === googleEntry,
+    "Google chooser selected the saved account and returned after sign-out",
+  );
+  assert.equal(await ev(siteSession, "location.search"), "?email=" + email);
+  await closePicker();
+  // The provider's consent screen can also show the account email.
+  pages["/consent"] =
+    googleRow(email) +
+    '<button onclick="this.dataset.clicked=1">Allow</button>';
+  pages["/login"] =
+    `<button onclick="location.href='https://accounts.google.com/consent'">Continue with Google</button>`;
+  await visit(context.origin + "/login");
+  await pick(googleEntry);
+  await until(
+    () => ev(siteSession, "location.pathname==='/consent'"),
+    "provider opened",
+  );
+  await sleep(500);
+  assert.equal(await ev(siteSession, "location.pathname"), "/consent");
+  await closePicker();
+  // Never choose a different identity or one of two identical visible rows.
+  pages[googlePath] =
+    googleRow(different) + googleRow(email) + googleRow(email);
+  await visit(googleUrl);
+  await sleep(500);
+  assert.equal(await ev(siteSession, "location.pathname"), googlePath);
+  await ev(
+    siteSession,
+    'document.querySelectorAll("[data-identifier]")[2].remove();document.querySelectorAll("[data-identifier]")[1].hidden=true',
+  );
+  await sleep(500);
+  assert.equal(await ev(siteSession, "location.pathname"), googlePath);
+  // Even an identical chooser in an unrelated tab must stay untouched.
+  pages[googlePath] = googleRow(email);
+  const separateTab = (await cmd("Target.createTarget", { url: "about:blank" }))
+    .targetId;
+  const separateSession = await attach(separateTab);
+  fixtureSessions.add(separateSession);
+  await cmd(
+    "Fetch.enable",
+    { patterns: [{ urlPattern: "*" }] },
+    separateSession,
+  );
+  await cmd("Page.navigate", { url: googleUrl }, separateSession);
+  await until(
+    () => ev(separateSession, "!!document.querySelector('[data-identifier]')"),
+    "unrelated chooser loaded",
+  );
+  await sleep(500);
+  assert.equal(await ev(separateSession, "location.href"), googleUrl);
+  await cmd("Target.closeTarget", { targetId: separateTab });
+  // A pending decision must be reauthorized after the vault locks.
+  await rpc("lock");
+  await ev(
+    siteSession,
+    'document.querySelectorAll("[data-identifier]")[1].hidden=false',
+  );
+  await sleep(500);
+  assert.equal(await ev(siteSession, "location.pathname"), googlePath);
+  await rpc("unlock", { password: "example test 4921" });
+  // Popup authentication. Pause the fixture at about:blank until interception is enabled.
+  pages["/login"] =
+    `<h1>Sign in</h1><button onclick="window.identityPopup=window.open('about:blank','fixture-idp')">Microsoft</button>`;
+  pages[msPath] =
+    `<div id="tilesHolder"><div role="button" onclick="window.name='wrong'">${different}</div><div role="button" onclick="opener.location.href='${context.origin}/returned?email=${email}';window.close()">Work<br>${email.toUpperCase()}</div></div>`;
+  await visit(context.origin + "/login");
+  await pick(microsoftEntry);
+  let child;
+  await until(async () => {
+    child = (await cmd("Target.getTargets")).targetInfos.find(
+      (t) => t.openerId === siteTarget && t.url === "about:blank",
+    );
+    return !!child;
+  }, "Microsoft provider opened its sign-in popup");
+  const childSession = await attach(child.targetId);
+  fixtureSessions.add(childSession);
+  await cmd("Fetch.enable", { patterns: [{ urlPattern: "*" }] }, childSession);
+  await ev(
+    siteSession,
+    "window.identityPopup.location.href=" + JSON.stringify(msUrl),
+  );
+  await until(
+    async () => (await rpc("site", context)).last === microsoftEntry,
+    "Microsoft popup selected the matching row and signed in the opener",
+  );
+  await closePicker();
+  const otherEntry = await idpEntry("Example ID");
+  pages["/login"] =
+    `<button onclick="this.hidden=true;document.querySelector('#idp').hidden=false">Sign in</button><button id="idp" hidden onclick="location.href='/returned?email=${different}'">Continue with Example ID</button>`;
+  await visit(context.origin + "/login");
+  await pick(otherEntry);
+  await until(
+    async () =>
+      (await rpc("site", context)).message?.includes("different account"),
+    "mismatched provider session reported",
+  );
+  assert.equal((await rpc("site", context)).last, microsoftEntry);
+  await closePicker();
+  for (const id of [googleEntry, microsoftEntry, otherEntry])
+    await rpc("delete", { id });
+  console.log(
+    "Passed provider switching through logout, redirect, delayed Google chooser, Microsoft popup, consent, ambiguous rows, and account mismatch.",
   );
   const savedWork = records.find((e) => e.label === "Work").id;
   fixture = "password";

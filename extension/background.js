@@ -92,6 +92,40 @@ async function execute(tabId, func, args = []) {
   });
   return injection?.result ?? {};
 }
+async function startProvider(job, entry, site) {
+  const key = "job:" + job.origin;
+  const provider = entry.provider;
+  // Persist before clicking. Redirects and newly opened tabs can arrive immediately.
+  job.handoff = crypto.randomUUID();
+  job.provider = provider;
+  job.filled = true;
+  job.message = site.embeddedProvider
+    ? "Click the embedded Google sign-in button to continue."
+    : site.ambiguousProvider
+      ? "Choose the " + provider + " sign-in button on the website."
+      : "Starting " +
+        provider +
+        " sign-in. If it stays closed, click the website’s " +
+        provider +
+        " button.";
+  await memory.set({ [key]: job });
+  await expireAt(job.expires);
+  if (site.providerButton) {
+    const result = await execute(job.tab, interactWithSite, [
+      job.origin,
+      { action: "startProvider", provider, documentToken: site.documentToken },
+    ]).catch(() => null); // A redirect can destroy the executing document.
+    if (result && !result.started) {
+      delete job.handoff;
+      job.message = "The sign-in page changed. Select the account again.";
+      await memory.set({ [key]: job });
+    }
+  }
+  await browserAPI.tabs
+    .sendMessage(job.tab, { type: "refreshCapture" }, { frameId: 0 })
+    .catch(() => {});
+  return false;
+}
 async function advance(job, entries) {
   const key = "job:" + job.origin;
   const original = JSON.stringify(job);
@@ -105,9 +139,14 @@ async function advance(job, entries) {
     return false;
   }
   const entry = entries.find((e) => e.id === job.id);
+  const provider = entry.method === "Provider" ? entry.provider : "";
   const site = await execute(job.tab, interactWithSite, [
     job.origin,
-    { openMenu: !job.opened && !job.logout && !job.filled },
+    {
+      provider,
+      openedLogin: job.openedLogin,
+      openMenu: !job.opened && !job.logout && !job.filled,
+    },
   ]);
   if (site.opened) job.opened = true;
   if (
@@ -127,6 +166,18 @@ async function advance(job, entries) {
       { action: "logout", documentToken: site.documentToken },
     ]).then((result) => !!result.logout);
     job.message = "Signing out of the current account…";
+  } else if (
+    provider &&
+    (site.providerButton || site.embeddedProvider || site.ambiguousProvider)
+  ) {
+    return startProvider(job, entry, site);
+  } else if (site.loginButton && !job.openedLogin) {
+    const result = await execute(job.tab, interactWithSite, [
+      job.origin,
+      { action: "openLogin", provider, documentToken: site.documentToken },
+    ]);
+    job.openedLogin = !!result.opened;
+    job.message = "Opening the website’s sign-in options…";
   } else if (!loginPage && !job.filled) {
     if (site.verification) {
       job.message = "Complete verification on the website to continue.";
@@ -146,7 +197,10 @@ async function advance(job, entries) {
         : "Open the account menu or sign out, then go to the sign-in form.";
     }
   } else if (!job.filled && loginPage) {
-    if (delegated) {
+    if (entry.method === "Provider") {
+      job.message =
+        "Waiting for the website’s " + provider + " sign-in button.";
+    } else if (delegated) {
       job.message =
         "Choose " +
         entry.username +
@@ -219,6 +273,81 @@ async function expireAt(expires) {
       (await browserAPI.alarms.get("expire"))?.scheduledTime || expires,
     ),
   });
+}
+// Only a chooser on the selected identity service can receive an account hint.
+const identityHosts = new Map([
+  ["google", ["https://accounts.google.com"]],
+  [
+    "microsoft",
+    ["https://login.microsoftonline.com", "https://login.live.com"],
+  ],
+]);
+function providerJob(state, tabId) {
+  return Object.entries(state).find(
+    ([name, job]) =>
+      name.startsWith("job:") &&
+      job.handoff &&
+      (job.tab === tabId || job.popup === tabId),
+  )?.[1];
+}
+async function providerMessage(job, m, sender, record, key) {
+  if (!job || !key) return false;
+  const origin = originOf(sender.url);
+  const storageKey = "job:" + job.origin;
+  const entry = (await unseal(record, key)).find(
+    (e) =>
+      e.id === job.id &&
+      e.origin === job.origin &&
+      e.method === "Provider" &&
+      e.provider === job.provider,
+  );
+  if (!entry) return false;
+  if (m.type === "providerReturned") {
+    if (
+      sender.tab.id !== job.tab ||
+      origin !== job.origin ||
+      m.handoff !== job.handoff
+    )
+      return false;
+    const verified =
+      typeof m.username === "string" &&
+      m.username.toLowerCase() === entry.username.toLowerCase();
+    job.message = verified
+      ? "Signed in as " + entry.username + "."
+      : m.username
+        ? "The website signed in a different account. Check its account menu."
+        : "The website is signed in. Check its account menu to confirm which account.";
+    delete job.handoff;
+    await memory.set({
+      [storageKey]: job,
+      ...(verified ? { ["last:" + origin]: entry.id } : {}),
+    });
+    return true;
+  }
+  if (
+    (job.identityTab !== undefined && job.identityTab !== sender.tab.id) ||
+    job.picked ||
+    job.chooserCancelled ||
+    !identityHosts.get(job.provider.toLowerCase())?.includes(origin)
+  )
+    return false;
+  if (m.type === "providerIdentity") {
+    if (job.identityTab === undefined) {
+      job.identityTab = sender.tab.id;
+      await memory.set({ [storageKey]: job });
+    }
+    return {
+      username: entry.username,
+      handoff: job.handoff,
+      expires: job.expires,
+    };
+  }
+  if (m.handoff !== job.handoff) return false;
+  job.picked = true;
+  job.message =
+    "Continuing " + job.provider + " sign-in for " + entry.username + ".";
+  await memory.set({ [storageKey]: job });
+  return true;
 }
 async function draftFor(sender, m, s, record, key) {
   const origin = originOf(sender.url);
@@ -370,8 +499,33 @@ async function handle(m, sender) {
   if (!ui) {
     if (!sender.tab || sender.frameId !== 0)
       throw Error("Top-level tab required.");
-    if (["canCapture", "capture", "attempt", "completed"].includes(m.type))
+    const handoff = providerJob(s, sender.tab.id);
+    if (
+      ["providerIdentity", "providerPick", "providerReturned"].includes(m.type)
+    )
+      return providerMessage(handoff, m, sender, record, key);
+    if (["canCapture", "capture", "attempt", "completed"].includes(m.type)) {
+      if (handoff && key) {
+        const origin = originOf(sender.url);
+        if (origin === handoff.origin && sender.tab.id === handoff.tab)
+          return m.type === "canCapture"
+            ? { providerReturn: handoff.handoff }
+            : false;
+        const hosts = identityHosts.get(handoff.provider.toLowerCase());
+        if (
+          hosts &&
+          !hosts.includes(origin) &&
+          origin !== handoff.origin &&
+          !handoff.chooserCancelled
+        ) {
+          // An unrelated document in this tab cannot start another automatic choice.
+          handoff.chooserCancelled = true;
+          await memory.set({ ["job:" + handoff.origin]: handoff });
+        }
+        return m.type === "canCapture" ? { resumeAt: handoff.expires } : false;
+      }
       return draftFor(sender, m, s, record, key);
+    }
     const job = s["job:" + originOf(sender.url)];
     if (
       m.type !== "advance" ||
@@ -449,6 +603,8 @@ async function handle(m, sender) {
         )
       )
         throw Error("That sign-in is already saved for this website.");
+      if (m.method === "Provider" && !provider)
+        throw Error("Enter the sign-in provider name for this account.");
       if (m.method === "Password" && !m.password)
         throw Error("Enter the password for this account.");
       const data = {
@@ -461,12 +617,16 @@ async function handle(m, sender) {
         password: m.method === "Password" ? m.password : "",
         updated: Date.now(),
       };
+      if (entry && s["job:" + entry.origin]?.id === entry.id)
+        await memory.remove("job:" + entry.origin);
       await write([data, ...entries.filter((e) => e.id !== data.id)]);
       if (draft && (m.draftId || draft.username === data.username))
         await dismiss();
       return data.id;
     }
     case "delete":
+      if (entry && s["job:" + entry.origin]?.id === entry.id)
+        await memory.remove("job:" + entry.origin);
       await write(entries.filter((e) => e.id !== m.id));
       return;
     case "draft": {
@@ -538,6 +698,8 @@ async function handle(m, sender) {
         originOf(target.url) !== origin
       )
         throw Error("The active website changed.");
+      if (entry.method === "Provider" && !entry.provider?.trim())
+        throw Error("Edit this account and enter its sign-in provider first.");
       const inProgress = s["job:" + origin];
       if (
         inProgress?.tab === m.tab &&
@@ -545,6 +707,8 @@ async function handle(m, sender) {
         !inProgress.filled
       )
         return inProgress.message;
+      const previous = providerJob(s, m.tab);
+      if (previous) await memory.remove("job:" + previous.origin);
       const job = {
         tab: m.tab,
         origin,
@@ -611,6 +775,22 @@ browserAPI.alarms.onAlarm.addListener(() =>
       await browserAPI.alarms.create("expire", { when: Math.min(...expiries) });
   }),
 );
+browserAPI.tabs.onCreated.addListener((tab) => {
+  if (!Number.isInteger(tab.openerTabId) || tab.incognito) return;
+  serialized(async () => {
+    const job = providerJob(await clean(), tab.openerTabId);
+    if (
+      job?.tab !== tab.openerTabId ||
+      job.popup !== undefined ||
+      job.identityTab !== undefined
+    )
+      return;
+    const opener = await browserAPI.tabs.get(job.tab);
+    if (originOf(opener.url) !== job.origin) return;
+    job.popup = tab.id;
+    await memory.set({ ["job:" + job.origin]: job });
+  }).catch(() => {});
+});
 browserAPI.tabs.onUpdated.addListener((id, change, tab) => {
   if (!change.url && change.status !== "complete") return;
   serialized(async () => {
@@ -620,6 +800,7 @@ browserAPI.tabs.onUpdated.addListener((id, change, tab) => {
       await detachOffer(id);
     for (const [name, job] of Object.entries(s)) {
       if (!name.startsWith("job:") || job.tab !== id) continue;
+      if (job.handoff) continue;
       if (originOf(tab.url) !== job.origin) await memory.remove(name);
       else if (change.status === "complete" && !job.filled)
         await execute(id, watchSwitch);

@@ -3,7 +3,7 @@
   if (globalThis.aprionSaveListener || top !== window) return;
   globalThis.aprionSaveListener = true;
   let enabled = false;
-  let toast, toastTimer, watchTimer;
+  let toast, toastTimer, watchTimer, resumeTimer;
   const authControls =
     'a[href], button, [role="button"], [role="menuitem"], input[type="button"], input[type="submit"]';
   const names = (element) =>
@@ -57,12 +57,20 @@
     const account = control.closest(
       '[role="menu"], [role="dialog"], header, nav',
     );
-    const emails = [
-      ...new Set(
-        account?.innerText.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) || [],
-      ),
-    ];
-    return { username: emails.length === 1 ? emails[0] : "" };
+    const emails = new Set();
+    if (account) {
+      // Adjacent labels can render as "name@example.comSign out" in innerText.
+      const walker = document.createTreeWalker(account, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (control.contains(node) || !visible(node.parentElement)) continue;
+        for (const address of node.textContent.match(
+          /[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi,
+        ) || [])
+          emails.add(address.toLowerCase());
+      }
+    }
+    return { username: emails.size === 1 ? [...emails][0] : "" };
   }
 
   async function send(details) {
@@ -72,19 +80,25 @@
     return reply?.value;
   }
 
-  function watchSignIn() {
+  function watchSignIn(providerReturn) {
     clearInterval(watchTimer);
     const until = Date.now() + 120_000;
     watchTimer = setInterval(async () => {
-      if (!enabled || Date.now() >= until) return clearInterval(watchTimer);
+      if ((!enabled && !providerReturn) || Date.now() >= until) {
+        clearInterval(watchTimer);
+        if (providerReturn) refresh();
+        return;
+      }
       const account = signedIn();
       if (!account) return;
       clearInterval(watchTimer);
       const offer = await send({
-        type: "completed",
+        type: providerReturn ? "providerReturned" : "completed",
+        handoff: providerReturn,
         username: account.username,
       });
       if (offer?.promptId) showOffer();
+      if (providerReturn) refresh();
     }, 500);
   }
 
@@ -94,13 +108,20 @@
   }
 
   async function refresh() {
+    clearTimeout(resumeTimer);
     enabled = false;
     clearInterval(watchTimer);
     const state = await send({ type: "canCapture" });
+    if (state?.resumeAt)
+      resumeTimer = setTimeout(
+        refresh,
+        Math.max(0, state.resumeAt - Date.now()),
+      );
     enabled = !!state?.enabled;
     if (state?.pending) showOffer();
     else toast?.remove();
-    if (state?.watch) watchSignIn();
+    if (state?.watch || state?.providerReturn)
+      watchSignIn(state.providerReturn);
   }
 
   refresh();

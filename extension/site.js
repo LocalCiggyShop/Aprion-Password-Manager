@@ -10,7 +10,7 @@ export function interactWithSite(origin, request) {
   const visible = (el) =>
     el.getClientRects().length &&
     getComputedStyle(el).visibility !== "hidden" &&
-    !el.matches(":disabled");
+    !el.closest(':disabled,[aria-disabled="true"],[inert]');
   const named = (el, pattern) =>
     [el.innerText, el.getAttribute("aria-label"), el.title, el.value].some(
       (name) => typeof name === "string" && pattern.test(name.trim()),
@@ -68,7 +68,7 @@ export function interactWithSite(origin, request) {
   }
   const controls = [
     ...document.querySelectorAll(
-      'button,a[href],[role="button"],[role="menuitem"],input[type="submit"]',
+      'button,a[href],[role="button"],[role="menuitem"],input[type="button"],input[type="submit"]',
     ),
   ].filter(visible);
   const exit = controls.find((el) => named(el, /^(log\s?out|sign\s?out)$/i));
@@ -77,17 +77,80 @@ export function interactWithSite(origin, request) {
       exit.click();
       return { logout: true };
     }
-    const menu = exit.closest('[role="menu"],[role="dialog"]');
-    const emails = [
-      ...new Set(menu?.innerText.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) || []),
-    ];
+    const menu = exit.closest('[role="menu"],[role="dialog"],header,nav');
+    const emails = new Set();
+    if (menu) {
+      // Adjacent labels can render as "name@example.comSign out" in innerText.
+      const walker = document.createTreeWalker(menu, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (exit.contains(node) || !visible(node.parentElement)) continue;
+        for (const address of node.textContent.match(
+          /[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi,
+        ) || [])
+          emails.add(address.toLowerCase());
+      }
+    }
     return {
       signedIn: true,
-      email: emails.length === 1 ? emails[0] : null,
+      email: emails.size === 1 ? [...emails][0] : null,
       documentToken,
     };
   }
   if (request.action === "logout") return {};
+  if (request.provider) {
+    const normalize = (label) =>
+      label.trim().replace(/\s+/g, " ").toLowerCase();
+    const provider = normalize(request.provider);
+    const loginContext =
+      /\/(?:login|log-in|signin|sign-in)(?:\/|$)/i.test(location.pathname) ||
+      [...document.querySelectorAll('h1,h2,[role="heading"]')].some(
+        (el) => visible(el) && named(el, /^(?:sign in|log in)(?: to .+)?$/i),
+      );
+    const matches = controls.filter((el) => {
+      if (el.parentElement?.closest('[role="button"],button,a[href]'))
+        return false;
+      if (el.tagName === "A" && el.protocol !== "https:") return false;
+      return [
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.title,
+        el.value,
+        el.querySelector("img[alt]")?.alt,
+      ].some((raw) => {
+        if (typeof raw !== "string") return false;
+        const label = normalize(raw);
+        const match =
+          /^(?:sign\s?in|log\s?in|continue) (?:with|using) (.+)$/.exec(label);
+        return match
+          ? match[1] === provider
+          : loginContext &&
+              label === provider &&
+              (el.matches('button,[role="button"],input[type="button"]') ||
+                !!el.closest('form,[role="dialog"]'));
+      });
+    });
+    if (matches.length === 1) {
+      if (request.action === "startProvider") {
+        matches[0].click();
+        return { started: true };
+      }
+      return { providerButton: true, documentToken };
+    }
+    if (request.action === "startProvider") return {};
+    if (matches.length > 1) return { ambiguousProvider: true };
+    if (
+      provider === "google" &&
+      [...document.querySelectorAll("iframe[src]")].some(
+        (frame) =>
+          visible(frame) &&
+          /^https:\/\/accounts\.google\.com\/gsi\/button(?:[/?#]|$)/.test(
+            frame.src,
+          ),
+      )
+    )
+      return { embeddedProvider: true };
+  }
   const loginForms = [];
   let verification = false;
   for (const form of document.forms) {
@@ -229,7 +292,22 @@ export function interactWithSite(origin, request) {
   );
   const destinations = [...new Set(links.map((el) => el.href))];
   if (destinations.length === 1) return { loginUrl: destinations[0] };
-  if (request.openMenu) {
+  if (request.provider && !request.openedLogin) {
+    const launchers = controls.filter(
+      (el) =>
+        el.matches('button,[role="button"]') &&
+        !el.closest("form") &&
+        named(el, /^(?:log\s?in|sign\s?in)$/i),
+    );
+    if (launchers.length === 1) {
+      if (request.action === "openLogin") {
+        launchers[0].click();
+        return { opened: true };
+      }
+      return { loginButton: true, documentToken };
+    }
+  }
+  if (!request.action && request.openMenu) {
     const menus = controls.filter((el) =>
       named(
         el,

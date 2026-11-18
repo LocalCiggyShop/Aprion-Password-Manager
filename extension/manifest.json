@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Aprion Password Manager",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A private, local vault and account picker for the website you're on.",
   "minimum_chrome_version": "121",
   "browser_specific_settings": {
@@ -22,6 +22,15 @@
       "matches": ["https://*/*"],
       "js": ["capture.js"],
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://accounts.google.com/*",
+        "https://login.microsoftonline.com/*",
+        "https://login.live.com/*"
+      ],
+      "js": ["provider-chooser.js"],
+      "run_at": "document_idle"
     }
   ],
   "background": {
