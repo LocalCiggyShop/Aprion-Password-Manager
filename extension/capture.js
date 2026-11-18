@@ -1,4 +1,5 @@
 (() => {
+  const browserAPI = globalThis.browser ?? globalThis.chrome;
   if (globalThis.aprionSaveListener || top !== window) return;
   globalThis.aprionSaveListener = true;
   let enabled = false;
@@ -32,7 +33,7 @@
   }
   async function refresh() {
     enabled = false;
-    const reply = await chrome.runtime
+    const reply = await browserAPI.runtime
       .sendMessage({ type: "canCapture" })
       .catch(() => null);
     enabled = !!reply?.value?.enabled;
@@ -40,7 +41,7 @@
     else toast?.remove();
   }
   refresh();
-  chrome.runtime.onMessage.addListener((msg) => {
+  browserAPI.runtime.onMessage.addListener((msg) => {
     if (msg.type === "refreshCapture") refresh();
   });
   document.addEventListener(
@@ -85,13 +86,13 @@
             form.innerText,
           ));
       if (emailLogin)
-        chrome.runtime
+        browserAPI.runtime
           .sendMessage({ type: "identity", username: user.value })
           .catch(() => {});
       if (!pw?.value && !emailLogin) {
         return;
       }
-      chrome.runtime
+      browserAPI.runtime
         .sendMessage({
           type: "capture",
           username: user?.value || "",

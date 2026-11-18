@@ -1,18 +1,19 @@
 import { deriveKey, protect, seal, unseal } from "./crypto.js";
 import { interactWithSite, watchSwitch } from "./site.js";
 
-const local = chrome.storage.local;
-const memory = chrome.storage.session; // Trusted extension contexts only, cleared on browser restart.
+const browserAPI = globalThis.browser ?? globalThis.chrome;
+const local = browserAPI.storage.local;
+const memory = browserAPI.storage.session; // Trusted extension contexts only, cleared on browser restart.
 const idle = 10 * 60_000;
 const lifetime = 120_000;
-const extension = chrome.runtime.getURL("");
+const extension = browserAPI.runtime.getURL("");
 let queue = Promise.resolve();
 function serialized(fn) {
   const next = queue.then(fn);
   queue = next.catch(() => {});
   return next;
 }
-local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+local.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" })?.catch(() => {});
 const originOf = (raw) => {
   try {
     const u = new URL(raw);
@@ -23,9 +24,9 @@ const originOf = (raw) => {
 };
 async function lock() {
   await memory.clear();
-  await chrome.action.setBadgeText({ text: "" });
-  for (const tab of await chrome.tabs.query({}))
-    await chrome.action
+  await browserAPI.action.setBadgeText({ text: "" });
+  for (const tab of await browserAPI.tabs.query({}))
+    await browserAPI.action
       .setBadgeText({ tabId: tab.id, text: "" })
       .catch(() => {});
 }
@@ -39,7 +40,7 @@ async function clean() {
     if (v?.expires <= Date.now()) {
       await memory.remove(k);
       if (k.startsWith("draft:"))
-        await chrome.action
+        await browserAPI.action
           .setBadgeText({ tabId: v.tab, text: "" })
           .catch(() => {});
       delete s[k];
@@ -50,7 +51,7 @@ async function clean() {
 async function touch(key) {
   const deadline = Date.now() + idle;
   await memory.set(key ? { deadline, key } : { deadline });
-  await chrome.alarms.create("lock", { when: deadline });
+  await browserAPI.alarms.create("lock", { when: deadline });
 }
 async function setProtection(entries, password) {
   const { record, key } = await protect(entries, password);
@@ -66,18 +67,20 @@ function publicEntry({ password, ...rest }) {
 async function promptsDisabled() {
   return (await local.get("disabledSaveSites")).disabledSaveSites || [];
 }
-async function execute(tab, func, args = [], doc) {
-  const target = doc
-    ? { tabId: tab, documentIds: [doc] }
-    : { tabId: tab, frameIds: [0] };
-  const [result] = await chrome.scripting.executeScript({ target, func, args });
-  return result;
+async function execute(tabId, func, args = []) {
+  const [injection] = await browserAPI.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    func,
+    args,
+  });
+  return injection?.result ?? {};
 }
 async function advance(job, entries) {
   const key = "job:" + job.origin;
   const original = JSON.stringify(job);
-  const tab = await chrome.tabs.get(job.tab);
+  const tab = await browserAPI.tabs.get(job.tab);
   if (
+    tab.incognito ||
     originOf(tab.url) !== job.origin ||
     !entries.some((e) => e.id === job.id)
   ) {
@@ -85,11 +88,10 @@ async function advance(job, entries) {
     return false;
   }
   const entry = entries.find((e) => e.id === job.id);
-  const { result: site, documentId } = await execute(
-    job.tab,
-    interactWithSite,
-    [job.origin, { openMenu: !job.opened && !job.logout && !job.filled }],
-  );
+  const site = await execute(job.tab, interactWithSite, [
+    job.origin,
+    { openMenu: !job.opened && !job.logout && !job.filled },
+  ]);
   if (site.opened) job.opened = true;
   if (
     site.signedIn &&
@@ -103,12 +105,10 @@ async function advance(job, entries) {
   const delegated = ["Provider", "Passkey"].includes(entry.method);
   const loginPage = site.login || (delegated && site.providerLogin);
   if (site.signedIn && !job.logout && !job.filled) {
-    job.logout = await execute(
-      job.tab,
-      interactWithSite,
-      [job.origin, { action: "logout" }],
-      documentId,
-    ).then((r) => !!r.result.logout);
+    job.logout = await execute(job.tab, interactWithSite, [
+      job.origin,
+      { action: "logout", documentToken: site.documentToken },
+    ]).then((result) => !!result.logout);
     job.message = "Signing out of the current account…";
   } else if (!loginPage && !job.filled) {
     if (
@@ -117,7 +117,7 @@ async function advance(job, entries) {
       originOf(site.loginUrl) === job.origin
     ) {
       job.redirected = true;
-      await chrome.tabs.update(job.tab, { url: site.loginUrl });
+      await browserAPI.tabs.update(job.tab, { url: site.loginUrl });
       job.message = "Opening the sign-in page…";
     } else {
       job.message = job.logout
@@ -134,20 +134,15 @@ async function advance(job, entries) {
         " sign-in.";
       job.filled = true;
     } else {
-      const response = await execute(
-        job.tab,
-        interactWithSite,
-        [
-          job.origin,
-          {
-            action: "fill",
-            entry: { username: entry.username, password: entry.password },
-            stage: job.stage || "username",
-          },
-        ],
-        documentId,
-      );
-      const result = response.result.stage;
+      const { stage: result } = await execute(job.tab, interactWithSite, [
+        job.origin,
+        {
+          action: "fill",
+          documentToken: site.documentToken,
+          entry: { username: entry.username, password: entry.password },
+          stage: job.stage || "username",
+        },
+      ]);
       if (result) {
         job.stage = result;
         job.message =
@@ -213,16 +208,18 @@ async function draftFor(sender, m, s, record, key) {
       expires,
     },
   });
-  await chrome.alarms.create("expire", {
+  await browserAPI.alarms.create("expire", {
     when: Math.min(
       expires,
-      (await chrome.alarms.get("expire"))?.scheduledTime || expires,
+      (await browserAPI.alarms.get("expire"))?.scheduledTime || expires,
     ),
   });
-  await chrome.action.setBadgeText({ tabId: tab, text: "SAVE" });
+  await browserAPI.action.setBadgeText({ tabId: tab, text: "SAVE" });
   return true;
 }
 async function handle(m, sender) {
+  if (sender.tab?.incognito)
+    throw Error("Aprion is unavailable in private windows.");
   const ui = [extension + "popup.html", extension + "vault.html"].includes(
     sender.url?.split(/[?#]/)[0],
   );
@@ -336,7 +333,7 @@ async function handle(m, sender) {
         const info = await execute(m.tab, interactWithSite, [origin, {}]).catch(
           () => null,
         );
-        if (info?.result.signedIn) current = info.result.email;
+        if (info?.signedIn) current = info.email;
       }
       return {
         enabled: !(await promptsDisabled()).includes(origin),
@@ -363,7 +360,7 @@ async function handle(m, sender) {
       await Promise.all(
         pending.map(([name, value]) => {
           if (name.startsWith("draft:"))
-            return chrome.action
+            return browserAPI.action
               .setBadgeText({ tabId: value.tab, text: "" })
               .catch(() => {});
         }),
@@ -371,10 +368,12 @@ async function handle(m, sender) {
       return;
     }
     case "switch": {
+      const target = await browserAPI.tabs.get(m.tab);
       if (
         !entry ||
+        target.incognito ||
         entry.origin !== origin ||
-        originOf((await chrome.tabs.get(m.tab)).url) !== origin
+        originOf(target.url) !== origin
       )
         throw Error("The active website changed.");
       const job = {
@@ -394,43 +393,44 @@ async function handle(m, sender) {
   }
   async function dismiss() {
     await memory.remove(draftKey);
-    await chrome.action
+    await browserAPI.action
       .setBadgeText({ tabId: m.tab, text: "" })
       .catch(() => {});
   }
 }
-chrome.runtime.onMessage.addListener((m, sender, reply) => {
+browserAPI.runtime.onMessage.addListener((m, sender, reply) => {
   serialized(() => handle(m, sender)).then(
     (value) => reply({ value }),
     (err) => reply({ error: err.message }),
   );
   return true;
 });
-chrome.runtime.onInstalled.addListener(() => {
+browserAPI.runtime.onInstalled.addListener(() => {
   serialized(async () => {
     // Save prompts now use the manifest's content script on every HTTPS site.
-    const scripts = await chrome.scripting.getRegisteredContentScripts();
+    const scripts = await browserAPI.scripting.getRegisteredContentScripts();
     const ids = scripts
       .filter(
         (script) =>
           script.id.startsWith("save-") && script.js?.includes("capture.js"),
       )
       .map((script) => script.id);
-    if (ids.length) await chrome.scripting.unregisterContentScripts({ ids });
+    if (ids.length)
+      await browserAPI.scripting.unregisterContentScripts({ ids });
     await local.remove("saveSites");
   });
 });
-chrome.alarms.onAlarm.addListener(() =>
+browserAPI.alarms.onAlarm.addListener(() =>
   serialized(async () => {
     const s = await clean();
     const expiries = Object.values(s)
       .map((value) => value?.expires)
       .filter(Boolean);
     if (expiries.length)
-      await chrome.alarms.create("expire", { when: Math.min(...expiries) });
+      await browserAPI.alarms.create("expire", { when: Math.min(...expiries) });
   }),
 );
-chrome.tabs.onUpdated.addListener((id, change, tab) => {
+browserAPI.tabs.onUpdated.addListener((id, change, tab) => {
   if (!change.url && change.status !== "complete") return;
   serialized(async () => {
     const s = await clean();
@@ -442,7 +442,7 @@ chrome.tabs.onUpdated.addListener((id, change, tab) => {
         originOf(change.url) !== job.origin
       ) {
         await memory.remove(name);
-        await chrome.action.setBadgeText({ tabId: id, text: "" });
+        await browserAPI.action.setBadgeText({ tabId: id, text: "" });
       }
       if (
         name === "identity:" + id &&
@@ -459,7 +459,7 @@ chrome.tabs.onUpdated.addListener((id, change, tab) => {
 });
 
 // Refresh the isolated form listeners when vault access or site consent changes.
-chrome.storage.onChanged.addListener((changes, area) => {
+browserAPI.storage.onChanged.addListener((changes, area) => {
   if (
     !(
       (area === "session" && changes.key) ||
@@ -470,19 +470,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
     )
   )
     return;
-  chrome.tabs
+  browserAPI.tabs
     .query({})
     .then((tabs) =>
       Promise.all(
         tabs.map((tab) =>
-          chrome.tabs
+          browserAPI.tabs
             .sendMessage(tab.id, { type: "refreshCapture" }, { frameId: 0 })
             .catch(() => {}),
         ),
       ),
     );
 });
-chrome.tabs.onRemoved.addListener((id) =>
+browserAPI.tabs.onRemoved.addListener((id) =>
   serialized(async () => {
     const state = await memory.get(null);
     await memory.remove(

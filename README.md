@@ -1,11 +1,16 @@
-<img src="extension/icons/128.png" alt="Aprion icon" width="64" height="64">
+<div align="center">
+  <img src="extension/icons/128.png" alt="Aprion icon" width="72" height="72">
+  <h1>Aprion Password Manager</h1>
+  <p><strong>100% local.</strong> Save and switch between website accounts.</p>
+  <p><a href="https://github.com/LocalCiggyShop/Aprion-Password-Manager/releases/latest/download/Aprion-Password-Manager.zip"><strong>Download Aprion</strong></a> · <a href="#install">Install</a></p>
+</div>
 
-# Aprion Password Manager
+---
 
-Save and switch between website accounts in Brave. Your vault stays on your device.
+## Install
 
-## Download and install
+Extract the ZIP and find the `extension` folder.
 
-1. [Download the ZIP](https://github.com/LocalCiggyShop/Aprion-Password-Manager/archive/refs/heads/main.zip) and extract it.
-2. Open `brave://extensions` and turn on **Developer mode**.
-3. Click **Load unpacked** and select the extracted `extension` folder.
+- **Chrome, Brave, Edge, Opera, and Vivaldi** — On the extensions page, enable **Developer mode**, click **Load unpacked**, and select the folder.
+- **Firefox** — Open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**, and select `extension/manifest.json`. Firefox removes temporary add-ons on restart.
+- **Safari on macOS** — Enable developer features in **Settings → Advanced**, then choose **Developer → Add Temporary Extension** and select the folder. If that option is unavailable, use [Apple’s Xcode packager](https://developer.apple.com/documentation/safariservices/packaging-a-web-extension-for-safari).

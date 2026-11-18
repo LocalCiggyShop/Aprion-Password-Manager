@@ -2,6 +2,11 @@
 // the form destination, even when the worker has already inspected this document.
 export function interactWithSite(origin, request) {
   if (location.origin !== origin || window !== top) return {};
+  // Keep the second call bound to the inspected document on browsers that
+  // cannot target a document ID with scripting.executeScript.
+  const documentToken = (globalThis.aprionDocumentToken ??=
+    crypto.randomUUID());
+  if (request.action && documentToken !== request.documentToken) return {};
   const visible = (el) =>
     el.getClientRects().length &&
     getComputedStyle(el).visibility !== "hidden" &&
@@ -25,7 +30,11 @@ export function interactWithSite(origin, request) {
     const emails = [
       ...new Set(menu?.innerText.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/gi) || []),
     ];
-    return { signedIn: true, email: emails.length === 1 ? emails[0] : null };
+    return {
+      signedIn: true,
+      email: emails.length === 1 ? emails[0] : null,
+      documentToken,
+    };
   }
   if (request.action === "logout") return {};
   const loginForms = [];
@@ -87,7 +96,7 @@ export function interactWithSite(origin, request) {
     loginForms.push({ form, username, password, safeDestination });
   }
   if (loginForms.length === 1) {
-    if (request.action !== "fill") return { login: true };
+    if (request.action !== "fill") return { login: true, documentToken };
     const { form, username, password, safeDestination } = loginForms[0];
     const { entry, stage } = request;
     if (
@@ -154,12 +163,14 @@ export function interactWithSite(origin, request) {
 }
 
 export function watchSwitch() {
+  const browserAPI = globalThis.browser ?? globalThis.chrome;
   if (globalThis.aprionSwitchTimer) return;
   let remaining = 120;
   globalThis.aprionSwitchTimer = setInterval(async () => {
     let active;
     try {
-      active = (await chrome.runtime.sendMessage({ type: "advance" }))?.value;
+      active = (await browserAPI.runtime.sendMessage({ type: "advance" }))
+        ?.value;
     } catch {}
     if (!active || !--remaining) {
       clearInterval(globalThis.aprionSwitchTimer);

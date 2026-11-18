@@ -1,3 +1,4 @@
+const browserAPI = globalThis.browser ?? globalThis.chrome;
 const app = document.querySelector("#app");
 const popup = document.body.classList.contains("popup");
 const paths = {
@@ -62,7 +63,7 @@ const btn = (action, label, glyph, cls = "ghost") =>
   label +
   "</span></button>";
 async function rpc(type, data = {}) {
-  const result = await chrome.runtime.sendMessage({ ...data, type });
+  const result = await browserAPI.runtime.sendMessage({ ...data, type });
   if (result?.error) throw Error(result.error);
   return result?.value;
 }
@@ -158,6 +159,18 @@ function renderAuth(create) {
 }
 async function boot() {
   const version = ++epoch;
+  if (popup) {
+    const [activeTab] = await browserAPI.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    if (version !== epoch) return;
+    if (activeTab?.incognito) {
+      app.innerHTML = `<section class="popup-view auth appear">${brand}<p>Aprion is unavailable in private windows.</p></section>`;
+      return;
+    }
+    tab = activeTab?.id;
+  }
   const state = await rpc("status");
   if (version !== epoch) return;
   unlocked = state.unlocked;
@@ -172,10 +185,7 @@ async function boot() {
     renderAuth(!state.exists);
     return;
   }
-  if (popup)
-    tab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
-      ?.id;
-  const url = tab && (await chrome.tabs.get(tab).catch(() => null))?.url;
+  const url = tab && (await browserAPI.tabs.get(tab).catch(() => null))?.url;
   origin = url?.startsWith("https://") ? new URL(url).origin : "";
   await reload(true);
   if (version !== epoch) return;
@@ -339,7 +349,7 @@ function renderVault(animate) {
     (settings
       ? `<section class="panel protection">
       <h2>Master password</h2>
-      <p class="muted">${requiresPassword ? "Required to open your vault after locking or restarting Brave." : deviceAccess}</p>
+      <p class="muted">${requiresPassword ? "Required to open your vault after locking or restarting your browser." : deviceAccess}</p>
       ${btn("protection", requiresPassword ? "Remove master password" : "Set master password", "lock", requiresPassword ? "ghost" : "primary")}
     </section>`
       : '<div class="columns"><section class="panel accountlist"><header class="listhead flex between"><h2>Saved logins</h2>' +
@@ -535,8 +545,8 @@ async function action(a, button) {
       a === "settings" ? "?settings=1" : a === "add" ? "?add=1&tab=" + tab : "";
     await playExit(app);
     try {
-      await chrome.tabs.create({
-        url: chrome.runtime.getURL("vault.html") + query,
+      await browserAPI.tabs.create({
+        url: browserAPI.runtime.getURL("vault.html") + query,
       });
       window.close();
     } finally {
@@ -656,7 +666,7 @@ for (const event of ["pointerdown", "keydown", "input"])
     },
     true,
   );
-chrome.storage.onChanged.addListener((changes, area) => {
+browserAPI.storage.onChanged.addListener((changes, area) => {
   if (
     (area === "session" && changes.key) ||
     (area === "local" &&

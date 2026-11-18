@@ -1,6 +1,6 @@
 # Aprion Password Manager
 
-Build a local password manager for Brave desktop. A website can have several saved accounts. Selecting one starts a switch in the current browser profile. The first release will target multiple accounts on the same HTTPS origin, including email-only and username-and-password forms.
+Build a local password manager for desktop browsers. A website can have several saved accounts. Selecting one starts a switch in the current browser profile. Support multiple accounts on the same HTTPS origin, including email-only and username-and-password forms.
 
 ## The toolbar popup
 
@@ -9,7 +9,7 @@ Use the compact menu in the first reference. Show the current website at the top
 | Control | Behavior |
 | --- | --- |
 | Select an account | Start switching to that account in the current tab. Show progress in the popup when open. |
-| Manage accounts | Open the full vault in a Brave tab with all saved accounts visible. |
+| Manage accounts | Open the full vault in a browser tab with all saved accounts visible. |
 | Add login account | Open a new entry for this website. Offer the most recent pending sign-in for this site, if one exists. Allow manual entry at any time after unlocking. |
 | Lock vault | Hide account details and require the master password to use them again. The website controls its own signed-in session. |
 
@@ -28,7 +28,7 @@ Discover sign-out and sign-in controls from the active page. Use the same logic 
 
 ## Saving at sign-in and sign-up
 
-Enable save prompts by default on HTTPS pages where Brave grants access. Let the user disable prompts per site and place help beside the control. While the vault is unlocked, offer **Save account** for a new login and **Update password** when an existing account’s password changes. Show the site and username so the user can verify the destination. A second email on the same site creates a separate entry. [Extension permissions](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
+Enable save prompts by default on HTTPS pages where the browser grants access. Let the user disable prompts per site and place help beside the control. While the vault is unlocked, offer **Save account** for a new login and **Update password** when an existing account’s password changes. Show the site and username so the user can verify the destination. A second email on the same site creates a separate entry. [Extension permissions](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
 
 Hold a submitted login briefly in extension memory so the save prompt survives the website redirect. Save it to the encrypted vault only after confirmation. Discard the pending entry on dismissal, expiry or lock. Exclude one-time codes and passkey challenges. If the user missed the prompt, Add login account can recall the pending entry during that window.
 
@@ -48,6 +48,6 @@ Use the second reference for the desktop layout. Pair a charcoal background with
 | 2. Local vault | Add master-password setup, an encrypted versioned vault, manual account management, explicit locking and inactivity locking. Use Web Crypto with a salted password-based key derivation function and authenticated encryption with a fresh nonce per write. | Two accounts for one website survive a browser restart. The vault starts locked. Persisted data and logs contain no readable credentials or unlock key. |
 | 3. Save and fill | Connect the picker to the active tab and add automatic save and update prompts with a per-site off switch. Recheck the target tab, top-level HTTPS origin and matching form before filling. | Exercise sign-up, sign-in, multi-step sign-in, changed passwords, declined saves, a lookalike domain and a tab that navigates during a fill. |
 | 4. Account switching | Implement and test the site-independent switching flow and the manual sign-out fallback. Keep the switch running if the popup closes. | Switch Personal → Work → Personal in Brave. Verify sign-out precedes filling, verification stays user-controlled, and an interrupted or failed login never receives the active checkmark. |
-| 5. Browser support | Keep vault logic, account matching and UI shared. Isolate tab access, storage, permissions and background lifecycle behind a small browser-specific layer. | Release first for tested Brave desktop versions. Run the same flows in Chrome and Edge next, then adapt and test Firefox and Safari individually. |
+| 5. Browser support | Share the vault, picker, and Manifest V3 package. Use a service worker in Chromium browsers and a background page in Firefox and Safari. | Check vault setup, switching, save prompts, and locking across browsers. |
 
-Brave supports Chromium-compatible extensions, making Manifest V3 a practical first target. Use temporary active-tab access for user-triggered operations and request longer-lived site access when the user enables a feature that needs it. [Brave extension support](https://support.brave.app/hc/en-us/articles/360017909112-How-can-I-add-extensions-to-Brave) · [Active tab access](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab)
+Use temporary active-tab access for user-triggered operations and HTTPS content scripts for automatic save prompts. [Active tab access](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab) · [WebExtension background scripts](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/manifest.json/background)
