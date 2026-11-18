@@ -6,6 +6,7 @@ const local = browserAPI.storage.local;
 const memory = browserAPI.storage.session; // Trusted extension contexts only, cleared on browser restart.
 const idle = 10 * 60_000;
 const lifetime = 120_000;
+const reviewLifetime = 5 * 60_000;
 const extension = browserAPI.runtime.getURL("");
 let queue = Promise.resolve();
 function serialized(fn) {
@@ -30,6 +31,25 @@ async function lock() {
       .setBadgeText({ tabId: tab.id, text: "" })
       .catch(() => {});
 }
+function offerKey(id) {
+  return "offer:" + id;
+}
+// A tab owns the notification. The review resolves the offer independently.
+function offerForTab(state, tab) {
+  const notice = state["draft:" + tab];
+  return notice ? state[offerKey(notice.id)] : null;
+}
+async function detachOffer(tab) {
+  await memory.remove("draft:" + tab);
+  await browserAPI.action
+    .setBadgeText({ tabId: tab, text: "" })
+    .catch(() => {});
+}
+async function discardOffer(state, offer) {
+  await memory.remove(offerKey(offer.id));
+  if (offerForTab(state, offer.tab)?.id === offer.id)
+    await detachOffer(offer.tab);
+}
 async function clean() {
   const s = await memory.get(null);
   if (s.key && s.deadline <= Date.now()) {
@@ -38,11 +58,8 @@ async function clean() {
   }
   for (const [k, v] of Object.entries(s)) {
     if (v?.expires <= Date.now()) {
-      await memory.remove(k);
-      if (k.startsWith("draft:"))
-        await browserAPI.action
-          .setBadgeText({ tabId: v.tab, text: "" })
-          .catch(() => {});
+      if (k.startsWith("offer:")) await discardOffer(s, v);
+      else await memory.remove(k);
       delete s[k];
     }
   }
@@ -111,7 +128,11 @@ async function advance(job, entries) {
     ]).then((result) => !!result.logout);
     job.message = "Signing out of the current account…";
   } else if (!loginPage && !job.filled) {
-    if (
+    if (site.verification) {
+      job.message = "Complete verification on the website to continue.";
+    } else if (job.stage === "password") {
+      job.message = "Waiting for the password step.";
+    } else if (
       site.loginUrl &&
       !job.redirected &&
       originOf(site.loginUrl) === job.origin
@@ -134,22 +155,38 @@ async function advance(job, entries) {
         " sign-in.";
       job.filled = true;
     } else {
-      const { stage: result } = await execute(job.tab, interactWithSite, [
-        job.origin,
-        {
-          action: "fill",
-          documentToken: site.documentToken,
-          entry: { username: entry.username, password: entry.password },
-          stage: job.stage || "username",
-        },
-      ]);
-      if (result) {
-        job.stage = result;
+      const { stage, submitted, wrongAccount } = await execute(
+        job.tab,
+        interactWithSite,
+        [
+          job.origin,
+          {
+            action: "fill",
+            documentToken: site.documentToken,
+            entry: { username: entry.username, password: entry.password },
+            stage: job.stage || "username",
+            usernameSubmitted: !!job.usernameSubmitted,
+          },
+        ],
+      );
+      if (wrongAccount) {
         job.message =
-          result === "password"
-            ? "Email filled. Continue to the password step."
-            : "Login filled. Review and submit on the website.";
-        job.filled = result === "done";
+          "Open a sign-in form for " +
+          entry.username +
+          " and select the account again.";
+        job.filled = true;
+      } else if (stage) {
+        job.stage = stage;
+        if (stage === "password") job.usernameSubmitted = submitted;
+        job.message =
+          stage === "password"
+            ? submitted
+              ? "Username submitted. Waiting for the password step."
+              : "Continue on the website to reach the password step."
+            : submitted
+              ? "Sign-in submitted. Complete any verification on the website."
+              : "Login filled. Review and submit on the website.";
+        job.filled = stage === "done";
         await memory.set({ ["last:" + job.origin]: entry.id });
       }
     }
@@ -199,14 +236,12 @@ async function draftFor(sender, m, s, record, key) {
     return false; // The identity provider handles its own credentials.
 
   const draftKey = "draft:" + tab;
+  const pending = offerForTab(s, tab);
   if (m.type === "canCapture") {
-    if (s[draftKey] && s[draftKey].origin !== origin) {
-      await memory.remove(draftKey);
-      await browserAPI.action.setBadgeText({ tabId: tab, text: "" });
-    }
+    if (pending && pending.origin !== origin) await detachOffer(tab);
     return {
       enabled: true,
-      pending: s[draftKey]?.origin === origin,
+      pending: pending?.origin === origin,
       watch: attempt?.origin === origin,
     };
   }
@@ -262,7 +297,6 @@ async function draftFor(sender, m, s, record, key) {
   const entries = await unseal(record, key);
   const previous = matchingLogin(entries, { ...login, origin });
   if (previous && previous.password === login.password) return false;
-  const pending = s[draftKey];
   if (
     pending?.origin === origin &&
     Object.keys(login).every((field) => login[field] === pending[field])
@@ -271,7 +305,8 @@ async function draftFor(sender, m, s, record, key) {
 
   const id = crypto.randomUUID();
   await memory.set({
-    [draftKey]: {
+    [draftKey]: { tab, id },
+    [offerKey(id)]: {
       ...login,
       origin,
       tab,
@@ -294,12 +329,11 @@ async function showPrompt(tab, id) {
 
   const draft = await serialized(async () => {
     const s = await clean();
-    const draftKey = "draft:" + tab;
-    const draft = s[draftKey];
+    const draft = offerForTab(s, tab);
     if (!draft || draft.prompted || (id && draft.id !== id)) return null;
     if (originOf(active.url) && originOf(active.url) !== draft.origin)
       return null;
-    await memory.set({ [draftKey]: { ...draft, prompted: true } });
+    await memory.set({ [offerKey(draft.id)]: { ...draft, prompted: true } });
     return draft;
   });
   if (!draft) return;
@@ -377,10 +411,10 @@ async function handle(m, sender) {
     local.set({ vault: await seal(rows, key, record) });
   const entry = entries.find((e) => e.id === m.id);
   const origin = originOf(m.origin);
-  const draftKey = "draft:" + m.tab;
-  const candidate = s[draftKey];
-  const draft =
-    candidate && (candidate.origin === origin || candidate.id === m.draftId)
+  const candidate = offerForTab(s, m.tab);
+  const draft = m.draftId
+    ? s[offerKey(m.draftId)]
+    : candidate?.origin === origin
       ? candidate
       : null;
   switch (m.type) {
@@ -404,7 +438,9 @@ async function handle(m, sender) {
         m.draftId &&
         (!draft || draft.id !== m.draftId || draft.origin !== origin)
       )
-        throw Error("This save offer is no longer available.");
+        throw Error(
+          "This save offer expired or was already handled. You can add the login manually.",
+        );
       const provider = providerName(m.method, m.provider);
       if (
         matchingLogin(
@@ -433,8 +469,16 @@ async function handle(m, sender) {
     case "delete":
       await write(entries.filter((e) => e.id !== m.id));
       return;
-    case "draft":
-      return draft;
+    case "draft": {
+      if (!draft || !m.beginReview) return draft;
+      const review = {
+        ...draft,
+        expires: Math.max(draft.expires, Date.now() + reviewLifetime),
+      };
+      await memory.set({ [offerKey(draft.id)]: review });
+      await expireAt(review.expires);
+      return review;
+    }
     case "dismiss":
       if (m.draftId && draft?.id !== m.draftId) return;
       return dismiss();
@@ -476,18 +520,13 @@ async function handle(m, sender) {
 
       const pending = Object.entries(s).filter(
         ([name, value]) =>
-          (name.startsWith("draft:") || name.startsWith("attempt:")) &&
+          (name.startsWith("offer:") || name.startsWith("attempt:")) &&
           value.origin === origin,
       );
-      await memory.remove(pending.map(([name]) => name));
-      await Promise.all(
-        pending.map(([name, value]) => {
-          if (name.startsWith("draft:"))
-            return browserAPI.action
-              .setBadgeText({ tabId: value.tab, text: "" })
-              .catch(() => {});
-        }),
-      );
+      for (const [name, value] of pending) {
+        if (name.startsWith("offer:")) await discardOffer(s, value);
+        else await memory.remove(name);
+      }
       return;
     }
     case "switch": {
@@ -499,6 +538,13 @@ async function handle(m, sender) {
         originOf(target.url) !== origin
       )
         throw Error("The active website changed.");
+      const inProgress = s["job:" + origin];
+      if (
+        inProgress?.tab === m.tab &&
+        inProgress.id === m.id &&
+        !inProgress.filled
+      )
+        return inProgress.message;
       const job = {
         tab: m.tab,
         origin,
@@ -515,14 +561,12 @@ async function handle(m, sender) {
       throw Error("Unknown request.");
   }
   async function dismiss() {
-    await memory.remove(draftKey);
-    await browserAPI.action
-      .setBadgeText({ tabId: m.tab, text: "" })
-      .catch(() => {});
-    if (m.tab)
+    if (draft) {
+      await discardOffer(s, draft);
       await browserAPI.tabs
-        .sendMessage(m.tab, { type: "refreshCapture" }, { frameId: 0 })
+        .sendMessage(draft.tab, { type: "refreshCapture" }, { frameId: 0 })
         .catch(() => {});
+    }
   }
 }
 browserAPI.runtime.onMessage.addListener((m, sender, reply) => {
@@ -571,16 +615,10 @@ browserAPI.tabs.onUpdated.addListener((id, change, tab) => {
   if (!change.url && change.status !== "complete") return;
   serialized(async () => {
     const s = await clean();
+    const offer = offerForTab(s, id);
+    if (offer && change.url && originOf(change.url) !== offer.origin)
+      await detachOffer(id);
     for (const [name, job] of Object.entries(s)) {
-      if (
-        job?.tab === id &&
-        name.startsWith("draft:") &&
-        change.url &&
-        originOf(change.url) !== job.origin
-      ) {
-        await memory.remove(name);
-        await browserAPI.action.setBadgeText({ tabId: id, text: "" });
-      }
       if (!name.startsWith("job:") || job.tab !== id) continue;
       if (originOf(tab.url) !== job.origin) await memory.remove(name);
       else if (change.status === "complete" && !job.filled)
@@ -616,6 +654,10 @@ browserAPI.storage.onChanged.addListener((changes, area) => {
 browserAPI.tabs.onRemoved.addListener((id) =>
   serialized(async () => {
     const state = await memory.get(null);
-    await memory.remove(Object.keys(state).filter((k) => state[k]?.tab === id));
+    await memory.remove(
+      Object.keys(state).filter(
+        (k) => !k.startsWith("offer:") && state[k]?.tab === id,
+      ),
+    );
   }),
 );

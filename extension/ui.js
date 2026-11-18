@@ -474,11 +474,8 @@ async function edit(id, recall = false, draftId = null) {
   const pending =
     recall &&
     (origin || draftId) &&
-    (await rpc("draft", { origin, tab, draftId }));
-  if (draftId && pending?.id !== draftId) {
-    notice("This save offer is no longer available.");
-    return;
-  }
+    (await rpc("draft", { origin, tab, draftId, beginReview: true }));
+  const expired = draftId && !pending;
   const old = id || pending?.existingId;
   const entry = old ? await rpc("detail", { id: old }) : {};
   const data = { ...entry, ...(pending || {}) };
@@ -491,7 +488,11 @@ async function edit(id, recall = false, draftId = null) {
         : old
           ? "Edit login account"
           : "Add login account") +
-      '</h2><form><label>Website<input required name="origin" placeholder="Website address"></label><label>Account label<input name="label" placeholder="Personal or Work"></label><label>Email or username<input required name="username" autocomplete="off"></label><label>Sign-in method<select name="method">' +
+      "</h2>" +
+      (expired
+        ? '<p class="muted">That save offer expired or was already handled. You can enter the sign-in details here.</p>'
+        : "") +
+      '<form><label>Website<input required name="origin" placeholder="Website address"></label><label>Account label<input name="label" placeholder="Personal or Work"></label><label>Email or username<input required name="username" autocomplete="off"></label><label>Sign-in method<select name="method">' +
       ["Password", "Email", "Provider", "Passkey"]
         .map((v) => "<option>" + v + "</option>")
         .join("") +
@@ -501,7 +502,7 @@ async function edit(id, recall = false, draftId = null) {
   );
   const f = d.querySelector("form");
   if (pending) d.dataset.draftId = pending.id;
-  f.elements.origin.value = data.origin || origin;
+  f.elements.origin.value = data.origin || (expired ? "" : origin);
   f.elements.origin.readOnly = !!pending;
   f.elements.label.value = data.label || "";
   f.elements.username.value = data.username || "";

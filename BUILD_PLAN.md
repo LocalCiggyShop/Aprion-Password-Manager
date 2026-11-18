@@ -19,7 +19,7 @@ When there are no entries, show the website and the Add login account action. Wh
 
 1. On the current website, the user opens Aprion and selects Work. Keep only one switch in progress for this site and browser profile, even if another tab also has the site open.
 2. If Personal is signed in, use the website’s own sign-out control. Wait until the signed-out state is confirmed. If already signed out, go straight to sign-in. Other tabs for the same site sharing the session may also be signed out.
-3. At the matching sign-in page, fill the Work email. On a password-based site, fill the saved password when its field appears. The user reviews the form, submits it and completes any verification.
+3. At the matching sign-in page, fill and submit Work’s credentials when Aprion recognizes the form and its submit control. If the sign-in has several steps, submit the username first and continue when the password field appears. The user completes any verification. When a site requires manual submission, show the filled form and let the user continue there.
 4. Mark Work as current only if the site confirms the identity. If the user cancels or signs in as someone else, show the observed state or “Last used.” Reopening the popup must reflect the actual stage of the switch.
 
 Save the email and sign-in method for passwordless accounts. Let the provider handle its account chooser and let the user enter any verification code.
@@ -30,7 +30,7 @@ Discover sign-out and sign-in controls from the active page. Use the same logic 
 
 Enable save prompts by default on HTTPS pages where the browser grants access. Let the user disable prompts per site and place help beside the control. While the vault is unlocked, open the picker for a detected sign-in in the active tab. If the browser cannot open the picker programmatically, open the review in a tab. Show the site and sign-in method so the user can confirm before saving. [Extension permissions](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions)
 
-Hold a submitted login briefly in extension memory so the save prompt survives a same-site redirect. For an email, provider, or passkey flow, wait for a recognizable signed-in state on the original site. Provider and passkey entries record the method and the account identity supplied by the site or confirmed by the user. Exclude one-time codes, provider passwords from delegated flows, and passkey challenges. Discard the pending entry on dismissal, expiry, or vault lock.
+Hold a submitted login briefly in extension memory. Keep an opened review available when the source tab redirects or closes. For an email, provider, or passkey flow, wait for a recognizable signed-in state on the original site. Provider and passkey entries record the method and the account identity supplied by the site or confirmed by the user. Exclude one-time codes, provider passwords from delegated flows, and passkey challenges. Discard the pending entry on dismissal, expiry, or vault lock.
 
 ## The full vault
 

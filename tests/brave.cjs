@@ -187,7 +187,10 @@ async function run(restartId, deviceSetup = false) {
     vault,
     `const f=document.querySelector('#auth');f.password.value=f.confirm.value='example test 4921';f.requestSubmit()`,
   );
-  await until(() => has(".columns"), "vault unlocked");
+  await until(
+    async () => (await has(".columns")) && !(await has("#startup")),
+    "vault unlocked",
+  );
   async function add(label, email) {
     await ev(vault, `document.querySelector('[data-act=add]').click();`);
     await until(() => has("dialog form"), "entry dialog");
@@ -254,22 +257,45 @@ async function run(restartId, deviceSetup = false) {
     .targetId;
   const siteSession = await attach(siteTarget);
   let fixture = "password";
+  const recordSubmission =
+    'onsubmit="event.preventDefault(); window.submitted=new FormData(this); window.submissionCount=(window.submissionCount || 0)+1"';
+  const passwordFields =
+    '<input name="username"><input name="password" type="password" autocomplete="current-password"><button>Sign in</button>';
   const pages = {
     password:
-      '<form onsubmit="event.preventDefault()"><input name="username"><input type="password" autocomplete="current-password"><button>Sign in</button></form>',
+      '<form method="post" ' +
+      recordSubmission +
+      ">" +
+      passwordFields +
+      "</form>",
     signed:
       '<button aria-label="Open account menu" onclick="document.querySelector(\'section\').hidden=false">Profile</button><section hidden role="menu">personal@example.net<button onclick="location.href=\'/login\'">Log out</button></section>',
     email:
-      '<form><input type="email" name="email"><button>Continue with Email</button></form>',
+      '<form method="post" ' +
+      recordSubmission +
+      '><input type="email" name="email"><button>Continue with Email</button></form>',
   };
   client.addEventListener("message", (e) => {
     const m = JSON.parse(e.data);
     if (m.method === "Fetch.requestPaused" && m.sessionId === siteSession) {
-      const html =
-        fixture === "signed" &&
-        new URL(m.params.request.url).pathname === "/login"
-          ? pages.email
-          : pages[fixture];
+      const url = new URL(m.params.request.url);
+      let html = pages[fixture];
+      if (fixture === "signed" && url.pathname === "/login")
+        html =
+          '<form method="post" action="/session">' + passwordFields + "</form>";
+      if (fixture === "signed" && url.pathname === "/session") {
+        const values = new URLSearchParams(m.params.request.postData);
+        const username = values.get("username");
+        const accepted =
+          m.params.request.method === "POST" &&
+          ((username === "work@example.net" &&
+            values.get("password") === "fixture-work") ||
+            (username === "personal@example.net" &&
+              values.get("password") === "fixture-personal"));
+        html = accepted
+          ? `<section role="menu">${username}<button onclick="location.href='/login'">Sign out</button></section>`
+          : "<p>Sign-in rejected</p>";
+      }
       cmd(
         "Fetch.fulfillRequest",
         {
@@ -461,9 +487,9 @@ async function run(restartId, deviceSetup = false) {
     () =>
       ev(
         siteSession,
-        'document.forms[0].username.value==="w@accounts-fixture.test"',
+        'window.submitted?.get("username")==="w@accounts-fixture.test" && window.submitted?.get("password")==="testSecret-34"',
       ),
-    "switch from toolbar",
+    "one toolbar click submits the chosen login",
   );
   assert.equal(
     await ev(siteSession, "document.forms[0].username.value"),
@@ -481,7 +507,7 @@ async function run(restartId, deviceSetup = false) {
     }),
   );
   console.log(
-    "Brave passed: active-tab grant, origin-bound username/password fill, foreign-origin rejection.",
+    "Brave passed: one-click login, active-tab grant, and foreign-origin rejection.",
   );
   await rpc("dismiss", context);
   assert.equal(await rpc("draft", context), null);
@@ -648,6 +674,22 @@ async function run(restartId, deviceSetup = false) {
           ),
         "review remembers provider",
       );
+      // The review belongs to the offer even if the site redirects afterward.
+      await visit("https://elsewhere-fixture.test/after-login");
+      await until(
+        async () => !(await rpc("draft", context)),
+        "redirect detaches the tab notification",
+      );
+      await until(
+        async () =>
+          !(
+            await rpc("site", {
+              tab: tabId,
+              origin: "https://elsewhere-fixture.test",
+            })
+          ).pending,
+        "unrelated site does not inherit the offer",
+      );
       await ev(
         reviewSession,
         "document.querySelector('dialog form').requestSubmit()",
@@ -669,38 +711,89 @@ async function run(restartId, deviceSetup = false) {
   console.log(
     "Brave passed: provider redirect, passkey and email offers, and passwordless review.",
   );
+  const savedWork = records.find((e) => e.label === "Work").id;
+  fixture = "password";
+  await visit(context.origin + "/login?get-form");
+  await ev(siteSession, "document.forms[0].method='get'");
+  await grantAction();
+  await rpc("switch", { ...context, id: savedWork });
+  assert.equal(
+    await ev(siteSession, "document.forms[0].password.value"),
+    "sample-password-v2",
+  );
+  assert.equal(
+    await ev(siteSession, "window.submissionCount || 0"),
+    0,
+    "password forms using GET require manual submission",
+  );
+  await closePicker();
+
+  await visit(context.origin + "/login?manual-submit");
+  await ev(
+    siteSession,
+    "document.querySelector('button').textContent='Confirm password'",
+  );
+  await grantAction();
+  await rpc("switch", { ...context, id: savedWork });
+  assert.equal(
+    await ev(siteSession, "window.submissionCount || 0"),
+    0,
+    "unrecognized buttons are left for manual submission",
+  );
+  await closePicker();
+
+  await visit(context.origin + "/login?other-account");
+  await ev(
+    siteSession,
+    "Object.assign(document.forms[0].username,{type:'hidden',value:'other@example.test'})",
+  );
+  await grantAction();
+  await rpc("switch", { ...context, id: savedWork });
+  assert.equal(
+    await ev(siteSession, "document.forms[0].password.value"),
+    "",
+    "credentials stay out of another account's form",
+  );
+  await closePicker();
+
   fixture = "email";
   await visit(context.origin + "/login");
   await grantAction();
   await rpc("switch", {
     ...context,
-    id: records.find((e) => e.label === "Work").id,
+    id: savedWork,
   });
   assert.equal(
-    await ev(siteSession, "document.querySelector('input').value"),
+    await ev(siteSession, "window.submitted?.get('email')"),
     "w@accounts-fixture.test",
   );
   await ev(
     siteSession,
-    `document.forms[0].innerHTML='<input type="password" autocomplete="one-time-code"><button>Continue</button>'`,
+    `document.forms[0].innerHTML='<input type="password" autocomplete="one-time-code"><button>Continue</button>';document.body.insertAdjacentHTML('beforeend','<a href="/login?restart">Sign in</a>')`,
   );
   await sleep(1300);
+  assert.equal(
+    await ev(siteSession, "location.search"),
+    "",
+    "verification stays on the current page",
+  );
   assert.equal(
     await ev(siteSession, "document.querySelector('input').value"),
     "",
     "verification code field remains empty",
   );
+  assert.equal(await ev(siteSession, "window.submissionCount"), 1);
   await ev(
     siteSession,
-    `document.forms[0].innerHTML='<input type="password" autocomplete="current-password"><button>Sign in</button>'`,
+    `document.forms[0].innerHTML='<input name="password" type="password" autocomplete="current-password"><button>Sign in</button>'`,
   );
   await until(
     () =>
       ev(
         siteSession,
-        "document.querySelector('input').value==='sample-password-v2'",
+        "window.submitted?.get('password')==='sample-password-v2' && window.submissionCount===2",
       ),
-    "second login step fills updated password",
+    "second login step submits updated password",
   );
   console.log(
     "Brave passed: multi-step login and verification-code exclusion.",
@@ -710,15 +803,15 @@ async function run(restartId, deviceSetup = false) {
     origin: switchOrigin,
     username: "work@example.net",
     label: "Work",
-    password: "",
-    method: "Email",
+    password: "fixture-work",
+    method: "Password",
   });
   const personalId = await rpc("save", {
     origin: switchOrigin,
     username: "personal@example.net",
     label: "Personal",
-    password: "",
-    method: "Email",
+    password: "fixture-personal",
+    method: "Password",
   });
   for (const [which, email] of [
     [workId, "work@example.net"],
@@ -737,14 +830,14 @@ async function run(restartId, deviceSetup = false) {
       () =>
         ev(
           siteSession,
-          'location.pathname==="/login" && document.querySelector("input")?.value===' +
+          'location.pathname==="/session" && document.querySelector("section")?.firstChild.textContent===' +
             JSON.stringify(email),
         ),
-      "sign-out followed by selected email fill",
+      "sign-out followed by sign-in as the selected account",
     );
   }
   console.log(
-    "Brave passed: two-way site-independent sign-out and email fill against intercepted fixture pages.",
+    "Brave passed: two-way sign-out and automatic sign-in against intercepted fixture pages.",
   );
   await ev(service, "chrome.storage.session.set({deadline:Date.now()-1})");
   assert.equal(
